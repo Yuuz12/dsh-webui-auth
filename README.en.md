@@ -99,7 +99,7 @@ Security events — login success/failure/rate-limit, setup, configure, disable,
   ```
 - **Settings page**: Settings → 身份认证 → "最近登录记录" (Recent activity) shows the last 8 entries.
 
-Audit write failures never block authentication (only a host-log warning). `audit.jsonl` is excluded via `.gitignore` and never committed.
+Audit write failures never block authentication (only a host-log warning).
 
 ## Appearance
 
