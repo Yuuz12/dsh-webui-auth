@@ -88,6 +88,10 @@ With either method, after the restart authentication is fully disabled. No brows
 - **Change / disable / log out**: Settings → 身份认证 (all require the current password); changing the password revokes every other logged-in session.
 - **Forgot password**: delete `dsh-webui-auth.json` in the plugin directory — a background check every minute disables authentication within at most 1 minute (no restart needed), then create a new account.
 
+## Appearance
+
+Both the login page and the "Settings → 身份认证 (Authentication)" settings page follow DSH's **built-in appearance setting** (Settings → General → Appearance: Light / Dark / System); no separate appearance switch is provided. The settings page lives inside the WebUI and consumes DSH's theme tokens directly, so it tracks light/dark automatically. The login page is a standalone page: the server reads the current appearance preference (settings `ui-theme.preference`), injects it into the page, and the page mirrors DSH's boot logic — `System` resolves via `prefers-color-scheme` and reacts live to OS changes. The login response is served with `cache-control: no-store`, so a refresh picks up any appearance change immediately.
+
 ## What to do after upgrading DSH
 
 1. Upgrade and restart DSH → the plugin detects the missing core patches and re-inserts them automatically (host log records `re-applied core patch`)

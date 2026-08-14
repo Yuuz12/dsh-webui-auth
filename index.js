@@ -274,6 +274,31 @@ function clearSessionCookie() {
   return COOKIE_NAME + '=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0'
 }
 
+// ---------------- DSH 外观偏好（浅色 / 深色 / 跟随系统） ----------------
+//
+// 复用 DSH 自带的外观设置：settings 命名空间 `ui-theme` 的 preference 字段
+// （与 @deepseek-ai/dsh-client-ui-theme 的 THEME_SETTINGS_NAMESPACE /
+// DEFAULT_PREFERENCE 完全一致），不新增独立外观开关。登录页是独立页面，
+// 加载不到 WebUI 的主题样式表，因此由服务端把当前偏好注入页面
+// （__THEME_PREFERENCE__），页面内嵌 design-platform 别名 token 子集并
+// 复刻 DSH 的 bootThemeScript：light → 浅色；dark → 深色；system → 按
+// prefers-color-scheme 实时跟随系统。
+const THEME_NAMESPACE = 'ui-theme'
+const THEME_PREFERENCE_DEFAULT = 'system'
+
+function themePreference(ctx) {
+  try {
+    const settings = ctx.get('settings')
+    if (settings === undefined) return THEME_PREFERENCE_DEFAULT
+    const section = settings.get(THEME_NAMESPACE)
+    if (section === undefined) return THEME_PREFERENCE_DEFAULT
+    const preference = section.preference
+    return (preference === 'light' || preference === 'dark') ? preference : THEME_PREFERENCE_DEFAULT
+  } catch (e) {
+    return THEME_PREFERENCE_DEFAULT
+  }
+}
+
 // ---------------- 登录页（内联，不依赖 WebUI bundle） ----------------
 
 const LOGIN_PAGE = `<!DOCTYPE html>
@@ -281,8 +306,39 @@ const LOGIN_PAGE = `<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
 <title>DSH WebUI 认证</title>
 <style>
+  /* DSH design-platform 别名 token 子集（逐项镜像 @deepseek-ai/dsh-client-ui-theme
+     lib/styles/design-platform.css）。登录页独立于 WebUI，无法加载其主题样式表，
+     故内嵌本页用到的 token：浅色定义在 body，深色定义在 body[data-ds-dark-theme]，
+     切换机制与 WebUI 完全一致（属性由下方 boot 脚本按 DSH 外观偏好设置）。 */
+  body {
+    --dsw-alias-bg-base: rgb(255, 255, 255);
+    --dsw-alias-bg-layer-1: rgb(255, 255, 255);
+    --dsw-alias-bg-layer-2: rgb(255, 255, 255);
+    --dsw-alias-border-l1: rgba(0, 0, 0, 0.04);
+    --dsw-alias-border-l2: rgba(0, 0, 0, 0.1);
+    --dsw-alias-label-primary: rgb(15, 17, 21);
+    --dsw-alias-label-secondary: rgb(97, 102, 107);
+    --dsw-alias-brand-primary: rgb(15, 17, 21);
+    --dsw-alias-state-error-primary: rgb(236, 19, 19);
+    --dsw-alias-state-success-primary: rgb(34, 197, 94);
+    --dsw-alias-state-warn-primary: rgb(245, 158, 11);
+  }
+  body[data-ds-dark-theme] {
+    --dsw-alias-bg-base: rgb(21, 21, 23);
+    --dsw-alias-bg-layer-1: rgb(35, 35, 36);
+    --dsw-alias-bg-layer-2: rgb(44, 44, 46);
+    --dsw-alias-border-l1: rgba(255, 255, 255, 0.06);
+    --dsw-alias-border-l2: rgba(255, 255, 255, 0.12);
+    --dsw-alias-label-primary: rgb(249, 250, 251);
+    --dsw-alias-label-secondary: rgb(207, 211, 214);
+    --dsw-alias-brand-primary: rgb(249, 250, 251);
+    --dsw-alias-state-error-primary: rgb(242, 90, 90);
+    --dsw-alias-state-success-primary: rgb(34, 197, 94);
+    --dsw-alias-state-warn-primary: rgb(245, 158, 11);
+  }
   body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
     background: var(--dsw-alias-bg-base, #f7f7f8); font-family: system-ui, -apple-system, 'Segoe UI', sans-serif; }
   .card { width: 340px; max-width: calc(100vw - 48px); padding: 28px 24px; box-sizing: border-box;
@@ -304,6 +360,28 @@ const LOGIN_PAGE = `<!DOCTYPE html>
 </style>
 </head>
 <body>
+<script>
+/* DSH 外观偏好（服务端注入：light / dark / system）。
+   与 WebUI 的 bootThemeScript 同一逻辑：system 时按系统 prefers-color-scheme
+   解析并实时响应系统切换；结果以 body 上的 data-ds-dark-theme 驱动上面的
+   token 选择器，与 DSH 内置外观设置保持一致。 */
+(function () {
+  var preference = "__THEME_PREFERENCE__";
+  if (preference !== 'light' && preference !== 'dark') preference = 'system';
+  var mq = typeof matchMedia !== 'undefined' ? matchMedia('(prefers-color-scheme: dark)') : null;
+  function apply() {
+    var systemDark = preference === 'system' && !!mq && mq.matches;
+    var dark = preference === 'dark' || systemDark;
+    document.documentElement.style.colorScheme = dark ? 'dark' : 'light';
+    document.body.toggleAttribute('data-ds-dark-theme', dark);
+  }
+  apply();
+  if (preference === 'system' && mq) {
+    if (typeof mq.addEventListener === 'function') mq.addEventListener('change', apply);
+    else if (typeof mq.addListener === 'function') mq.addListener(apply);
+  }
+})();
+</script>
 <div class="card">
   <h1>DSH WebUI</h1>
   <p class="sub" id="sub"></p>
@@ -584,8 +662,10 @@ export async function apply(ctx) {
     handler: async (req, res) => {
       try {
         if (req.method === 'GET' || req.method === 'HEAD') {
-          const page = LOGIN_PAGE.replace('__MODE__', enabledFlag ? 'login' : 'setup')
-          res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+          const page = LOGIN_PAGE
+            .replace('__MODE__', enabledFlag ? 'login' : 'setup')
+            .replace('__THEME_PREFERENCE__', themePreference(ctx))
+          res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
           res.end(page)
           return
         }

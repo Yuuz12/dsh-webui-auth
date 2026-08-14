@@ -88,6 +88,10 @@ npx @deepseek-ai/dsh plugin --profile web add github:Yuuz12/dsh-webui-auth
 - **修改 / 禁用 / 退出**：设置 → 身份认证（均需当前密码）；修改密码会吊销其他所有已登录会话。
 - **忘记密码**：删除插件目录的 `dsh-webui-auth.json` 即可——后台每分钟自动检测，最多 1 分钟内认证自动关闭（无需重启），之后重新创建账号即可。
 
+## 外观
+
+登录页与「设置 → 身份认证」设置页都跟随 DSH **自带的外观设置**（设置 → 通用 → 外观：浅色 / 深色 / 跟随系统），不提供独立的外观开关。设置页运行在 WebUI 内，直接消费 DSH 的主题 token，天然随明暗切换；登录页是独立页面，由服务端读取当前外观偏好（settings `ui-theme.preference`）注入页面，并复刻 DSH 的 boot 逻辑：`跟随系统` 时按 `prefers-color-scheme` 解析、系统明暗切换时实时变化。登录页响应带 `cache-control: no-store`，外观变更后刷新即可生效。
+
 ## 升级 DSH 后的操作流程
 
 1. 升级并重启 DSH → 插件检测到核心补丁缺失，自动重新插入（宿主日志记录 `re-applied core patch`）
