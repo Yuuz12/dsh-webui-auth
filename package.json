@@ -13,6 +13,7 @@
   "files": [
     "index.js",
     "lib/client.js",
+    "cordis.patch.yml",
     "README.md",
     "README.zh.md"
   ],
@@ -25,6 +26,9 @@
     "gate"
   ],
   "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
     "client": {
       "platform": "web",
       "inject": [

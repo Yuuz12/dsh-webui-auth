@@ -19,6 +19,30 @@ Sessions are **server-side, in-memory**, carried by an `HttpOnly; SameSite=Lax` 
 
 ## Installation
 
+This plugin is a standard **bundle**; the official `dsh plugin` command is the recommended way to install it. The manual method is kept as a fallback.
+
+### Method 1: `dsh plugin` command (recommended)
+
+Prerequisite: pnpm on the machine (Node ships corepack — run `corepack enable pnpm` to activate it).
+
+Install from GitHub:
+
+```sh
+npx @deepseek-ai/dsh plugin --profile web add github:Yuuz12/dsh-webui-auth
+```
+
+Or from a local directory:
+
+```sh
+npx @deepseek-ai/dsh plugin --profile web add ./dsh-webui-auth
+```
+
+The command invokes pnpm inside the profile directory: it adds the dependency and appends it to the `dsh.profile.bundles` list, and the plugin row is inserted automatically via the bundle layer. Git installs fetch source code — this package is plain JavaScript with no build step, so it works directly (no prepare script or build authorization needed).
+
+If you previously installed manually, clean up first: delete `profiles/web/node_modules/dsh-webui-auth/` and remove the manual row below, then run the command.
+
+### Method 2: manual (fallback)
+
 1. Put the `dsh-webui-auth` directory into `profiles/web/node_modules/`
 2. Add one row to the `insert` list in `profiles/web/cordis.patch.yml`:
 
@@ -26,6 +50,8 @@ Sessions are **server-side, in-memory**, carried by an `HttpOnly; SameSite=Lax` 
     - id: dsh-webui-auth
       name: 'dsh-webui-auth'
 ```
+
+### Common to both methods
 
 3. **Apply the core-package patches** (no manual re-patching needed after a DSH upgrade): in
    `node_modules/@deepseek-ai/dsh-client-connection/lib/index.js` and
@@ -35,8 +61,16 @@ Sessions are **server-side, in-memory**, carried by an `HttpOnly; SameSite=Lax` 
 
 ## Uninstallation
 
-1. **(Optional) Restore the core packages**: delete the code blocks starting with `// [dsh-webui-auth patch]` in `dsh-client-connection/lib/index.js` (2 places) and `dsh-client-modules/lib/index.js` (1 place). **Leaving them is harmless** — once the plugin is gone the gate never triggers (the patched code is a no-op without the plugin), and a DSH upgrade overwrites them anyway.
-2. **Delete the plugin directory** `profiles/web/node_modules/dsh-webui-auth/` (the credentials file `dsh-webui-auth.json` goes with it).
+### Method 1: `dsh plugin` command (for method-1 installs)
+
+1. `npx @deepseek-ai/dsh plugin --profile web remove dsh-webui-auth` (removes both the dependency and the bundle layer)
+2. **(Optional) Restore the core packages**: delete the code blocks starting with `// [dsh-webui-auth patch]` in `dsh-client-connection/lib/index.js` (2 places) and `dsh-client-modules/lib/index.js` (1 place). **Leaving them is harmless** — once the plugin is gone the gate never triggers (the patched code is a no-op without the plugin), and a DSH upgrade overwrites them anyway.
+3. Restart DSH
+
+### Method 2: manual (for method-2 installs)
+
+1. **(Optional) Restore the core packages** (same as above)
+2. **Delete the plugin directory** `profiles/web/node_modules/dsh-webui-auth/` (the credentials file `dsh-webui-auth.json` goes with it)
 3. **Remove the mount row** from `profiles/web/cordis.patch.yml`:
 
 ```yaml
@@ -45,7 +79,9 @@ Sessions are **server-side, in-memory**, carried by an `HttpOnly; SameSite=Lax` 
 ```
 
    This step is required — otherwise the loader fails at startup because the package is missing.
-4. **Restart DSH**: authentication is fully disabled. No browser cleanup is needed (sessions live in process memory and disappear with it; cookies become invalid). If you previously used the older pre-hardening build, the leftover `dsh-webui-auth.session` key in browser localStorage is harmless and may be removed optionally.
+4. **Restart DSH**
+
+With either method, after the restart authentication is fully disabled. No browser cleanup is needed (sessions live in process memory and disappear with it; cookies become invalid). If you previously used the older pre-hardening build, the leftover `dsh-webui-auth.session` key in browser localStorage is harmless and may be removed optionally.
 
 ## Usage
 

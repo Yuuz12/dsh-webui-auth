@@ -19,6 +19,30 @@ DSH WebUI 身份认证插件（持久化插件）。在「设置 → 身份认�
 
 ## 安装
 
+本插件是标准**组合包（bundle）**，推荐用 DSH 官方 `plugin` 命令安装；手动方式保留作备用。
+
+### 方式一：`dsh plugin` 命令（推荐）
+
+前提：机器上有 pnpm（Node 自带 corepack，执行 `corepack enable pnpm` 即可启用）。
+
+从 GitHub 安装：
+
+```sh
+npx @deepseek-ai/dsh plugin --profile web add github:Yuuz12/dsh-webui-auth
+```
+
+或从本地目录安装：
+
+```sh
+npx @deepseek-ai/dsh plugin --profile web add ./dsh-webui-auth
+```
+
+命令会在 profile 目录内调用 pnpm：加入依赖并追加到 `dsh.profile.bundles` 列表，插件行随组合包层自动插入。GitHub 安装拉取的是源码——本包为纯 JavaScript、无构建步骤，直接可用（无需 prepare 脚本或构建授权）。
+
+若此前用手动方式安装过，先清理：删除 `profiles/web/node_modules/dsh-webui-auth/` 并移除下方手动行，再执行命令安装。
+
+### 方式二：手动（备用）
+
 1. 将 `dsh-webui-auth` 目录放入 `profiles/web/node_modules/`
 2. 在 `profiles/web/cordis.patch.yml` 的 `insert` 列表中加一行：
 
@@ -26,6 +50,8 @@ DSH WebUI 身份认证插件（持久化插件）。在「设置 → 身份认�
     - id: dsh-webui-auth
       name: 'dsh-webui-auth'
 ```
+
+### 两种方式通用
 
 3. **打核心包补丁**（升级 DSH 后**无需手动重打**）：在
    `node_modules/@deepseek-ai/dsh-client-connection/lib/index.js` 与
@@ -35,9 +61,17 @@ DSH WebUI 身份认证插件（持久化插件）。在「设置 → 身份认�
 
 ## 卸载
 
-1. **（可选）恢复核心包源码**：删除 `dsh-client-connection/lib/index.js`（2 处）与 `dsh-client-modules/lib/index.js`（1 处）中以 `// [dsh-webui-auth patch]` 开头的代码块。**不删也没有副作用**——插件消失后闸门自动失效（补丁代码在无插件时为空操作），升级 DSH 会自然覆盖清除
-2. **删除插件目录** `profiles/web/node_modules/dsh-webui-auth/`
-3. **移除挂载行**：从 `profiles/web/cordis.patch.yml` 删除：
+### 方式一：`dsh plugin` 命令（对应方式一安装）
+
+1. `npx @deepseek-ai/dsh plugin --profile web remove dsh-webui-auth`（同时移除依赖与组合包层）
+2. **（可选）恢复核心包源码**：删除 `dsh-client-connection/lib/index.js`（2 处）与 `dsh-client-modules/lib/index.js`（1 处）中以 `// [dsh-webui-auth patch]` 开头的代码块。**不删也没有副作用**——插件消失后闸门自动失效（补丁代码在无插件时为空操作），升级 DSH 会自然覆盖清除
+3. 重启 DSH
+
+### 方式二：手动（对应方式二安装）
+
+1. **（可选）恢复核心包源码**（同上）
+2. 删除插件目录 `profiles/web/node_modules/dsh-webui-auth/`
+3. 从 `profiles/web/cordis.patch.yml` 移除挂载行：
 
 ```yaml
     - id: dsh-webui-auth
@@ -45,7 +79,9 @@ DSH WebUI 身份认证插件（持久化插件）。在「设置 → 身份认�
 ```
 
    此步必须做，否则重启时加载器找不到插件包会报错
-4. **重启 DSH**：认证门禁完全关闭。浏览器无需手动清理（会话存于进程内存随进程消失，Cookie 自动失效）；如曾用旧版插件，可清除浏览器 localStorage 中的 `dsh-webui-auth.session` 残留（无害）
+4. 重启 DSH
+
+两种方式重启后认证门禁完全关闭，浏览器无需手动清理（会话存于进程内存随进程消失，Cookie 自动失效）；如曾用旧版插件，可清除浏览器 localStorage 中的 `dsh-webui-auth.session` 残留（无害）。
 
 ## 使用
 

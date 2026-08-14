@@ -1,0 +1,4 @@
+# dsh-webui-auth 组合包层：安装本 bundle 时插入插件行
+- insert:
+    - id: dsh-webui-auth
+      name: 'dsh-webui-auth'
