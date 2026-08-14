@@ -984,10 +984,12 @@ export async function apply(ctx) {
           return
         }
         const wasEnabled = isEnabled(creds)
+        // creds 可能为 null（首次启用认证时还没有凭据文件）：
+        // wasEnabled 为 false，下方所有 creds.* 访问都必须以 wasEnabled 为前提。
         // 仅当现有哈希是 scrypt 格式时才允许"密码留空=不修改"：
         // 旧版 v1 哈希（非 scrypt）不能被原样保留（登录校验只认 scrypt），
         // 此时必须提供新密码，否则账号会因哈希格式不符而无法登录。
-        const hashIsScrypt = typeof creds.hash === 'string' && creds.hash.startsWith(SCRYPT_PREFIX)
+        const hashIsScrypt = creds !== null && typeof creds.hash === 'string' && creds.hash.startsWith(SCRYPT_PREFIX)
         const keepPassword = wasEnabled && !password && hashIsScrypt
         if (wasEnabled && !password && !hashIsScrypt) {
           await auditLog(ctx, 'configure_failure', { username, ip: meta.ip, ua: meta.ua, detail: '旧版哈希不支持保留，必须设置新密码' })
