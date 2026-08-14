@@ -99,7 +99,7 @@ npx @deepseek-ai/dsh plugin --profile web add github:Yuuz12/dsh-webui-auth
   ```
 - **设置页**：设置 → 身份认证 → 「最近登录记录」展示最近 8 条。
 
-审计写入失败不影响认证主流程（仅记宿主日志）。`audit.jsonl` 已被 `.gitignore` 排除，不会随源码提交。
+审计写入失败不影响认证主流程（仅记宿主日志）。
 
 ## 外观
 
