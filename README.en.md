@@ -21,29 +21,25 @@ Sessions are **server-side, in-memory**, carried by an `HttpOnly; SameSite=Lax` 
 
 ## Installation
 
-This plugin is a standard **bundle**; the official `dsh plugin` command is the recommended way to install it. The manual method is kept as a fallback.
+This plugin is a standard **bundle**, published on npm — the official `dsh plugin` command is the recommended way to install it. The manual method is kept as a fallback. Prerequisite: pnpm on the machine (Node ships corepack — run `corepack enable pnpm` to activate it).
 
-### Method 1: `dsh plugin` command (recommended)
+### Method 1: npm install (recommended)
 
-Prerequisite: pnpm on the machine (Node ships corepack — run `corepack enable pnpm` to activate it).
+```sh
+npx @deepseek-ai/dsh plugin --profile web add dsh-webui-auth
+```
 
-Install from GitHub:
+Pulls the prebuilt package from the npm registry (plain JS — no prepare script, no build authorization), adds the dependency and appends it to the `dsh.profile.bundles` list; the plugin row is inserted automatically via the bundle layer.
+
+### Method 2: GitHub install
 
 ```sh
 npx @deepseek-ai/dsh plugin --profile web add github:Yuuz12/dsh-webui-auth
 ```
 
-Or from a local directory:
+Fetches the repository source (works directly — no build step either). Prefer Method 1 when the network to GitHub is unreliable.
 
-```sh
-npx @deepseek-ai/dsh plugin --profile web add ./dsh-webui-auth
-```
-
-The command invokes pnpm inside the profile directory: it adds the dependency and appends it to the `dsh.profile.bundles` list, and the plugin row is inserted automatically via the bundle layer. Git installs fetch source code — this package is plain JavaScript with no build step, so it works directly (no prepare script or build authorization needed).
-
-If you previously installed manually, clean up first: delete `profiles/web/node_modules/dsh-webui-auth/` and remove the manual row below, then run the command.
-
-### Method 2: manual (fallback)
+### Method 3: manual (fallback)
 
 1. Put the `dsh-webui-auth` directory into `profiles/web/node_modules/`
 2. Add one row to the `insert` list in `profiles/web/cordis.patch.yml`:
@@ -53,7 +49,9 @@ If you previously installed manually, clean up first: delete `profiles/web/node_
       name: 'dsh-webui-auth'
 ```
 
-### Common to both methods
+> Maintainer dev mode: `dsh plugin --profile web add ./dsh-webui-auth` from a local source checkout (`link:` install) — edit code, restart DSH, done; no reinstall needed.
+
+### Common to all methods
 
 3. **Apply the core-package patches** (no manual re-patching needed after a DSH upgrade): in
    `node_modules/@deepseek-ai/dsh-client-connection/lib/index.js` and

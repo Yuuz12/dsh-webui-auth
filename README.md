@@ -21,29 +21,25 @@ DSH WebUI 身份认证插件（持久化插件）。在「设置 → 身份认�
 
 ## 安装
 
-本插件是标准**组合包（bundle）**，推荐用 DSH 官方 `plugin` 命令安装；手动方式保留作备用。
+本插件是标准**组合包（bundle）**，已发布到 npm，推荐用 DSH 官方 `plugin` 命令安装；手动方式保留作备用。前提：机器上有 pnpm（Node 自带 corepack，执行 `corepack enable pnpm` 即可启用）。
 
-### 方式一：`dsh plugin` 命令（推荐）
+### 方式一：npm 安装（推荐）
 
-前提：机器上有 pnpm（Node 自带 corepack，执行 `corepack enable pnpm` 即可启用）。
+```sh
+npx @deepseek-ai/dsh plugin --profile web add dsh-webui-auth
+```
 
-从 GitHub 安装：
+从 npm registry 拉取预构建代码（纯 JS 包，无 prepare 脚本、无需构建授权），加入依赖并追加到 `dsh.profile.bundles` 列表，插件行随组合包层自动插入。
+
+### 方式二：GitHub 安装
 
 ```sh
 npx @deepseek-ai/dsh plugin --profile web add github:Yuuz12/dsh-webui-auth
 ```
 
-或从本地目录安装：
+拉取仓库源码（同样直接可用，无需构建步骤）；网络不佳时优先用方式一。
 
-```sh
-npx @deepseek-ai/dsh plugin --profile web add ./dsh-webui-auth
-```
-
-命令会在 profile 目录内调用 pnpm：加入依赖并追加到 `dsh.profile.bundles` 列表，插件行随组合包层自动插入。GitHub 安装拉取的是源码——本包为纯 JavaScript、无构建步骤，直接可用（无需 prepare 脚本或构建授权）。
-
-若此前用手动方式安装过，先清理：删除 `profiles/web/node_modules/dsh-webui-auth/` 并移除下方手动行，再执行命令安装。
-
-### 方式二：手动（备用）
+### 方式三：手动（备用）
 
 1. 将 `dsh-webui-auth` 目录放入 `profiles/web/node_modules/`
 2. 在 `profiles/web/cordis.patch.yml` 的 `insert` 列表中加一行：
@@ -53,7 +49,9 @@ npx @deepseek-ai/dsh plugin --profile web add ./dsh-webui-auth
       name: 'dsh-webui-auth'
 ```
 
-### 两种方式通用
+> 维护者开发模式：在本地源码目录使用 `dsh plugin --profile web add ./dsh-webui-auth`（`link:` 安装），改代码 → 重启 DSH 即生效，无需重新安装。
+
+### 所有方式通用
 
 3. **打核心包补丁**（升级 DSH 后**无需手动重打**）：在
    `node_modules/@deepseek-ai/dsh-client-connection/lib/index.js` 与
