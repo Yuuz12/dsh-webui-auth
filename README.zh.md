@@ -19,7 +19,7 @@ DSH WebUI 身份认证插件（持久化插件）。在「设置 → 身份认�
 
 ## 安装
 
-1. 将 `dsh-webui-auth` 目录放入 `profiles/web/node_modules/`（与 `dsh-vision-helper` 同级）
+1. 将 `dsh-webui-auth` 目录放入 `profiles/web/node_modules/`
 2. 在 `profiles/web/cordis.patch.yml` 的 `insert` 列表中加一行：
 
 ```yaml
