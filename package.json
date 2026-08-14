@@ -15,7 +15,7 @@
     "lib/client.js",
     "cordis.patch.yml",
     "README.md",
-    "README.zh.md"
+    "README.en.md"
   ],
   "license": "MIT",
   "keywords": [
