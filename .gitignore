@@ -1,0 +1,7 @@
+# 凭据文件（含真实账号与密码哈希）——切勿提交
+dsh-webui-auth.json
+
+# 通用忽略
+*.log
+.DS_Store
+Thumbs.db

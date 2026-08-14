@@ -1,0 +1,38 @@
+{
+  "name": "dsh-webui-auth",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "lib/client.js",
+    "README.md",
+    "README.zh.md"
+  ],
+  "license": "MIT",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "auth",
+    "login",
+    "gate"
+  ],
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-connection"
+      ]
+    }
+  },
+  "description": "Persistent WebUI authentication plugin for DeepSeek Harness: configure an account/password in Settings, then accessing the WebUI requires login. Zero dependencies."
+}
