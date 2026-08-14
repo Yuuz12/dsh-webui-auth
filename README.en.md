@@ -2,8 +2,6 @@
 
 English | [中文](README.md)
 
-Persistent vision plugin for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness).
-
 A persistent WebUI authentication plugin for DeepSeek Harness. Once you create an account/password in **Settings → 身份认证 (Authentication)** or via the first-run login page, **unauthenticated browsers cannot load any WebUI resource, call any API, or open any realtime connection** — authentication is enforced at the HTTP/transport layer and cannot be bypassed through browser devtools.
 
 ## Architecture
