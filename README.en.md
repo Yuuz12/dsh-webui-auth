@@ -84,9 +84,22 @@ With either method, after the restart authentication is fully disabled. No brows
 ## Usage
 
 - **First enable**: while no credentials exist, authentication is off (all requests pass). Open WebUI → Settings → 身份认证 (Authentication), create an account/password (≥8 characters, must include uppercase, lowercase, digit and special character) and save; or visit `/dsh-webui-auth/login` directly — the page shows a "Create administrator account" form. Authentication takes effect immediately and the current browser receives a session automatically.
+- **Username rule**: 3-32 characters of letters, digits, underscore or hyphen (enforced on create/change; legacy accounts are unaffected and can still log in).
 - **Afterwards**: any unauthenticated visit to any path redirects to the login page; after login you stay signed in for the chosen **session lifetime** (browser session / 1 hour / 12 hours (default) / 1 day / 3 days), enforced server-side by expiry. "Browser session" mode: the 30-minute window slides with activity, and closing the browser logs you out.
 - **Change / disable / log out**: Settings → 身份认证 (all require the current password); changing the password revokes every other logged-in session.
 - **Forgot password**: delete `dsh-webui-auth.json` in the plugin directory — a background check every minute disables authentication within at most 1 minute (no restart needed), then create a new account.
+
+## Audit log
+
+Security events — login success/failure/rate-limit, setup, configure, disable, logout — are **appended as JSONL to `audit.jsonl`** in the plugin directory (timestamp, username, IP, user-agent, detail). Two ways to view:
+
+- **CLI** (recommended): run `node index.js audit [--limit N]` in the plugin directory (last 20 entries by default):
+  ```sh
+  node index.js audit --limit 50
+  ```
+- **Settings page**: Settings → 身份认证 → "最近登录记录" (Recent activity) shows the last 8 entries.
+
+Audit write failures never block authentication (only a host-log warning). `audit.jsonl` is excluded via `.gitignore` and never committed.
 
 ## Appearance
 
@@ -101,8 +114,10 @@ Both the login page and the "Settings → 身份认证 (Authentication)" setting
 
 ## Data & Security
 
-- Credentials are stored as a salted SHA-256 hash in `dsh-webui-auth.json` inside the plugin directory; plaintext is never written to disk.
-- Login rate limiting: at most 5 failures per minute.
+- Passwords are hashed with **scrypt** (Node's built-in memory-hard KDF — GPU/ASIC resistant, zero dependencies) and stored in `dsh-webui-auth.json` inside the plugin directory; plaintext is never written to disk. **Since 0.2.0 only scrypt hashes are accepted**: 0.1.x SHA-256 credentials can no longer be verified — delete `dsh-webui-auth.json` and recreate the account (see "Forgot password").
+- Login rate limiting: at most 5 failures per minute. Failed verifications also run a dummy scrypt pass so "unknown account" and "wrong password" take the same time, defeating username enumeration via response timing.
+- Audit log: security events are appended to `audit.jsonl` (see "Audit log" above).
+- Security headers on the login page and API responses: strict CSP, `nosniff`, `DENY` framing, `no-referrer`, `noindex`, `no-store`.
 - Cookie `HttpOnly + SameSite=Lax`: not readable by JS, not sent on cross-site requests.
 - The login/setup endpoints are intentionally public (the entry point of authentication); pre-registered exact endpoints such as `/dsh-vision-helper/config` are not gated (configuration data only, not WebUI access).
 

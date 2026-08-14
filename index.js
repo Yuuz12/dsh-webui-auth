@@ -24,8 +24,16 @@
  * "create administrator account" form; creating credentials enables the gate
  * immediately and opens a session.
  *
+ * Password hashing: scrypt (Node built-in memory-hard KDF). Credentials written
+ * by older builds (v1 salted SHA-256) are no longer verifiable — delete
+ * dsh-webui-auth.json and recreate the account to upgrade (see README).
+ *
+ * Audit log: security events (login success/failure/rate-limit, setup,
+ * configure, disable, logout) are appended as JSONL to audit.jsonl in the
+ * plugin folder. View via CLI:  node index.js audit [--limit N]
+ *
  * Credentials live in the plugin's own folder (`dsh-webui-auth.json` next to
- * this module) as a salted SHA-256 hash — never plaintext.
+ * this module) as an scrypt hash — never plaintext.
  *
  * Endpoints:
  *   GET  /dsh-webui-auth/login       login page (public, mode by enabled state)
@@ -33,102 +41,91 @@
  *   POST /dsh-webui-auth/setup       { username, password }   -> { ok, error? } (first-run only)
  *   POST /dsh-webui-auth/logout      (session required)       -> { ok }
  *   GET  /dsh-webui-auth/status      (session required)       -> { enabled, username, ttl }
+ *   GET  /dsh-webui-auth/audit       (session required)       -> { ok, entries: [...] } (?limit=N)
  *   POST /dsh-webui-auth/configure   (session required) { username, password?, current, ttl? }
  *   POST /dsh-webui-auth/disable     (session required) { current }
  */
 
-import { randomBytes } from "node:crypto";
+import { randomBytes, scrypt as scryptCb, timingSafeEqual } from "node:crypto";
 import { createRequire } from "node:module";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync, appendFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { resolve as resolvePath } from "node:path";
+import { promisify } from "node:util";
 
 export const name = 'dsh-webui-auth'
 
 export const inject = ['webServer', 'fs', 'clientModules']
 
-// ---------------- SHA-256（手写实现，UTF-8 感知，已通过 NIST 测试向量验证） ----------------
+// ---------------- 密码哈希：scrypt（Node 内置内存硬 KDF，零依赖） ----------------
+//
+// 取代旧版手写 SHA-256：SHA-256 极快，GPU 上每秒可算数十亿次，加盐也无济于事；
+// scrypt 是内存硬 KDF（计算需占用大量内存，难以并行/ASIC 加速），是 Node 官方
+// 推荐的口令哈希方案（npm 自身认证体系即用它）。
+//
+// 存储格式（自描述，参数可随版本调整）：
+//   "scrypt:N:r:p:saltB64:hashB64"
+// 注意：旧版 v1 凭据（SHA-256）自 0.2.0 起不再支持校验，需删除
+// dsh-webui-auth.json 后重新创建账号（见 README「忘记密码」）。
 
-let H = null
-let K = null
+const SCRYPT_N = 32768          // 2^15，约 32 MiB 内存
+const SCRYPT_R = 8
+const SCRYPT_P = 1
+const SCRYPT_KEYLEN = 64
+const SCRYPT_MAXMEM = 64 * 1024 * 1024
+const SCRYPT_PREFIX = 'scrypt:'
 
-function sha256(input) {
-  // input: byte string（每个字符码 0-255）
-  const rotateRight = (n, b) => (n >>> b) | (n << (32 - b))
-  const maxWord = Math.pow(2, 32)
-  let result = ''
-  const words = []
-  const bitLength = input.length * 8
-  if (H === null) {
-    H = []
-    K = []
-    let primeCounter = 0
-    const isComposite = {}
-    for (let candidate = 2; primeCounter < 64; candidate++) {
-      if (!isComposite[candidate]) {
-        for (let i = 0; i < 313; i += candidate) isComposite[i] = candidate
-        H[primeCounter] = (Math.pow(candidate, 0.5) * maxWord) | 0
-        K[primeCounter++] = (Math.pow(candidate, 1 / 3) * maxWord) | 0
-      }
-    }
-  }
-  let hash = H.slice()
-  input += '\x80'
-  while (input.length % 64 - 56) input += '\x00'
-  for (let i = 0; i < input.length; i++) {
-    const j = input.charCodeAt(i)
-    if (j >> 8) return ''
-    words[i >> 2] |= j << (((3 - i) % 4) * 8)
-  }
-  words[words.length] = (bitLength / maxWord) | 0
-  words[words.length] = bitLength
-  for (let j = 0; j < words.length;) {
-    const w = words.slice(j, (j += 16))
-    const oldHash = hash.slice(0, 8)
-    for (let i = 0; i < 64; i++) {
-      const w15 = w[i - 15]
-      const w2 = w[i - 2]
-      const a = hash[0]
-      const e = hash[4]
-      const temp1 = hash[7]
-        + (rotateRight(e, 6) ^ rotateRight(e, 11) ^ rotateRight(e, 25))
-        + ((e & hash[5]) ^ (~e & hash[6]))
-        + K[i]
-        + (w[i] = (i < 16) ? w[i] : (
-            w[i - 16]
-            + (rotateRight(w15, 7) ^ rotateRight(w15, 18) ^ (w15 >>> 3))
-            + w[i - 7]
-            + (rotateRight(w2, 17) ^ rotateRight(w2, 19) ^ (w2 >>> 10))
-          ) | 0)
-      const temp2 = (rotateRight(a, 2) ^ rotateRight(a, 13) ^ rotateRight(a, 22))
-        + ((a & hash[1]) ^ (a & hash[2]) ^ (hash[1] & hash[2]))
-      const next = [(temp1 + temp2) | 0].concat(hash)
-      next[4] = (next[4] + temp1) | 0
-      hash = next
-    }
-    for (let i = 0; i < 8; i++) hash[i] = (hash[i] + oldHash[i]) | 0
-  }
-  for (let i = 0; i < 8; i++) {
-    for (let j = 3; j + 1; j--) {
-      const b = (hash[i] >> (j * 8)) & 255
-      result += ((b < 16) ? '0' : '') + b.toString(16)
-    }
-  }
-  return result
+const scrypt = promisify(scryptCb)
+
+/** 生成新密码哈希（含随机盐），格式见上。 */
+async function hashPassword(password) {
+  const salt = randomBytes(16).toString('base64')
+  const derived = await scrypt(password, salt, SCRYPT_KEYLEN, { N: SCRYPT_N, r: SCRYPT_R, p: SCRYPT_P, maxmem: SCRYPT_MAXMEM })
+  return SCRYPT_PREFIX + SCRYPT_N + ':' + SCRYPT_R + ':' + SCRYPT_P + ':' + salt + ':' + derived.toString('base64')
 }
 
-function utf8Bytes(str) {
-  let out = ''
-  const bytes = new TextEncoder().encode(str)
-  for (let i = 0; i < bytes.length; i++) out += String.fromCharCode(bytes[i])
-  return out
+/** 校验 scrypt 哈希（恒定时间比较）。格式异常一律返回 false，绝不抛错。 */
+async function verifyPassword(password, stored) {
+  if (typeof stored !== 'string' || !stored.startsWith(SCRYPT_PREFIX)) return false
+  const parts = stored.split(':')
+  if (parts.length !== 6) return false
+  const n = Number(parts[1])
+  const r = Number(parts[2])
+  const p = Number(parts[3])
+  const salt = parts[4]
+  let expected = null
+  try { expected = Buffer.from(parts[5], 'base64') } catch (e) { return false }
+  if (!Number.isInteger(n) || n < 1024 || !Number.isInteger(r) || r < 1 || !Number.isInteger(p) || p < 1 || !expected || expected.length === 0) return false
+  try {
+    const derived = await scrypt(password, salt, expected.length, { N: n, r, p, maxmem: SCRYPT_MAXMEM })
+    return timingSafeEqual(derived, expected)
+  } catch (e) {
+    return false
+  }
 }
 
-// 启动自检：NIST 测试向量
-function selfTest() {
-  const a = sha256(utf8Bytes('abc'))
-  const b = sha256(utf8Bytes(''))
-  return a === 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad'
-    && b === 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+/**
+ * 时序均衡：用户名不存在/哈希格式不符时，对固定 dummy 哈希做一次与真实
+ * 校验等价的 scrypt 验证（结果恒为 false），使"账号不存在"与"密码错误"
+ * 的响应耗时一致，抹平用户名枚举差异。
+ */
+let dummyHashPromise = null
+function dummyHash() {
+  if (dummyHashPromise === null) {
+    dummyHashPromise = hashPassword(randomBytes(8).toString('hex')).catch((e) => {
+      dummyHashPromise = null // 生成失败可重试，不永久卡死
+      throw e
+    })
+  }
+  return dummyHashPromise
 }
+async function dummyVerify(password) {
+  const h = await dummyHash()
+  return verifyPassword(password, h) // 恒 false，但成本与真实校验一致（恰好 1 次 scrypt）
+}
+
+// 供测试与工具脚本使用（Cordis 加载时只消费 name/inject/apply，多余导出无副作用）
+export { hashPassword, verifyPassword, auditLog, readAuditEntries }
 
 // ---------------- 配置（凭据）存储 ----------------
 
@@ -189,15 +186,90 @@ function isEnabled(creds) {
   return !!(creds && typeof creds.username === 'string' && typeof creds.hash === 'string')
 }
 
-function hashPassword(salt, password) {
-  return sha256(salt + ':' + utf8Bytes(password))
+// 用户名约束：3-32 位字母、数字、下划线或连字符。
+// 登录/验证时不做格式校验（旧账号不受影响），仅在新建/修改凭据时强制。
+const USERNAME_RE = /^[A-Za-z0-9_-]{3,32}$/
+
+function usernameError(username) {
+  if (typeof username !== 'string' || !USERNAME_RE.test(username)) {
+    return '用户名需为 3-32 位字母、数字、下划线或连字符'
+  }
+  return null
 }
 
-function randomSalt() {
-  const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
-  let out = ''
-  for (let i = 0; i < 24; i++) out += chars[Math.floor(Math.random() * chars.length)]
-  return out
+// ---------------- 审计日志（JSONL 追加写，位于插件目录 audit.jsonl） ----------------
+//
+// 记录登录成功/失败/限流/锁定、初始化、修改、禁用、退出等安全事件。
+// 追加写不阻塞主流程：失败仅记日志，绝不影响认证本身。
+// 查看：node index.js audit [--limit N]（CLI 模式，见文件末尾）。
+
+const AUDIT_FILE = 'audit.jsonl'
+
+function auditFileForCli() {
+  const dir = pluginDir()
+  return dir ? dir + '/' + AUDIT_FILE : null
+}
+
+async function auditFilePath(ctx) {
+  const dir = pluginDir()
+  if (!dir) return null
+  try {
+    // ctx.fs.resolve 返回 { targetKey, displayPath } 对象（不是字符串），
+    // 原生 node:fs 需要物理路径 displayPath；targetKey 仅供 ctx.fs 自身使用。
+    const r = await ctx.fs.resolve(dir + '/' + AUDIT_FILE)
+    if (r && typeof r.displayPath === 'string') return r.displayPath
+    if (r && typeof r.targetKey === 'string') return r.targetKey
+  } catch (e) { /* fall through */ }
+  return dir + '/' + AUDIT_FILE
+}
+
+/**
+ * 追加一条审计事件。fields 中的值必须是字符串/数字/null。
+ */
+async function auditLog(ctx, event, fields) {
+  let target = null
+  try {
+    target = await auditFilePath(ctx)
+    if (!target) return
+    const entry = { ts: new Date().toISOString(), event }
+    for (const key of Object.keys(fields || {})) {
+      const v = fields[key]
+      if (v === undefined) continue
+      entry[key] = typeof v === 'string' || typeof v === 'number' ? v : String(v)
+    }
+    appendFileSync(target, JSON.stringify(entry) + '\n', 'utf8')
+  } catch (e) {
+    try {
+      ctx.logger.warn('[dsh-webui-auth] audit write failed: ' + (e && e.message ? e.message : String(e)))
+    } catch (err) { /* ignore */ }
+  }
+}
+
+function requestMeta(req) {
+  let ip = null
+  try { ip = req.socket && req.socket.remoteAddress ? String(req.socket.remoteAddress) : null } catch (e) { /* ignore */ }
+  let ua = null
+  try { ua = typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'] : null } catch (e) { /* ignore */ }
+  return { ip, ua }
+}
+
+/**
+ * 读取最近 limit 条审计记录（新→旧）。文件缺失/损坏时返回空数组，绝不抛错。
+ */
+async function readAuditEntries(ctx, limit) {
+  let target = null
+  try {
+    target = await auditFilePath(ctx)
+    if (!target) return []
+    const lines = readFileSync(target, 'utf8').split('\n').filter((l) => l.trim())
+    const out = []
+    for (let i = lines.length - 1; i >= 0 && out.length < limit; i--) {
+      try { out.push(JSON.parse(lines[i])) } catch (e) { /* skip malformed line */ }
+    }
+    return out
+  } catch (e) {
+    return []
+  }
 }
 
 // 认证有效期（小时）：0 = 浏览器会话（关闭浏览器后失效）
@@ -225,7 +297,11 @@ function passwordStrength(p) {
 
 function sendJson(res, status, body) {
   const text = JSON.stringify(body)
-  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' })
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'x-content-type-options': 'nosniff',
+    'cache-control': 'no-store',
+  })
   res.end(text)
 }
 
@@ -350,6 +426,15 @@ const LOGIN_PAGE = `<!DOCTYPE html>
   input { box-sizing: border-box; width: 100%; padding: 7px 9px; font-size: 13px; color: var(--dsw-alias-label-primary, #222);
     background: var(--dsw-alias-bg-layer-2, #fff); border: 1px solid var(--dsw-alias-border-l1, #ccc); border-radius: 4px; outline: none; }
   input:focus { border-color: var(--dsw-alias-brand-primary, #4a7cf7); }
+  /* 深色模式下浏览器自动填充会把输入框刷成白色/黄色：用 inset 大阴影 + text-fill-color
+     回压为当前主题的输入底色（与 DSH 主题 token 联动，明暗模式都正确） */
+  input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:focus {
+    -webkit-text-fill-color: var(--dsw-alias-label-primary, #222);
+    -webkit-box-shadow: 0 0 0 1000px var(--dsw-alias-bg-layer-2, #fff) inset;
+    box-shadow: 0 0 0 1000px var(--dsw-alias-bg-layer-2, #fff) inset;
+    caret-color: var(--dsw-alias-label-primary, #222);
+    transition: background-color 999999s ease-in-out 0s;
+  }
   button { width: 100%; margin-top: 18px; padding: 8px 18px; font-size: 13px; cursor: pointer;
     color: var(--dsw-alias-label-primary, #222); background: var(--dsw-alias-bg-layer-1, #fff);
     border: 1px solid var(--dsw-alias-border-l2, #999); border-radius: 4px; }
@@ -415,11 +500,12 @@ if (MODE === 'setup') {
 } else {
   sub.textContent = '此界面已启用身份认证，请登录后继续使用。';
 }
+function validUsername(name) { return /^[A-Za-z0-9_-]{3,32}$/.test(name); }
 f.addEventListener('submit', function (ev) {
   ev.preventDefault();
   var username = u.value.trim(), password = p.value;
   if (MODE === 'setup') {
-    if (!username) return show('请输入用户名');
+    if (!validUsername(username)) return show('用户名需为 3-32 位字母、数字、下划线或连字符');
     if (password.length < 8) return show('密码至少需要 8 位');
     if (!/[a-z]/.test(password)) return show('密码必须包含小写字母');
     if (!/[A-Z]/.test(password)) return show('密码必须包含大写字母');
@@ -436,6 +522,7 @@ f.addEventListener('submit', function (ev) {
     b.disabled = false; b.textContent = MODE === 'setup' ? '创建账号' : '登录';
     if (r && r.error === 'rate-limited') show('尝试次数过多，请一分钟后重试');
     else if (r && r.error === 'weak-password') show('密码强度不足：至少 8 位，需包含大小写字母、数字和特殊符号');
+    else if (r && r.error === 'username-invalid') show('用户名需为 3-32 位字母、数字、下划线或连字符');
     else if (r && r.error === 'not-configured') show('凭据尚未配置，请刷新页面后重新创建');
     else if (r && r.error === 'already-configured') show('认证已启用，请使用登录模式');
     else show(MODE === 'setup' ? '创建失败，请检查输入' : '用户名或密码错误');
@@ -579,10 +666,6 @@ export function ensureCorePatches(ctx) {
 }
 
 export async function apply(ctx) {
-  if (!selfTest()) {
-    ctx.logger.error('[dsh-webui-auth] sha256 self-test FAILED — refusing to start')
-    return
-  }
   // 核心包补丁自检/自动重打（升级 DSH 后无需手动操作）
   const patchState = ensureCorePatches(ctx)
   if (!patchState.ok) {
@@ -665,7 +748,16 @@ export async function apply(ctx) {
           const page = LOGIN_PAGE
             .replace('__MODE__', enabledFlag ? 'login' : 'setup')
             .replace('__THEME_PREFERENCE__', themePreference(ctx))
-          res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
+          // 登录页安全响应头：页面完全自包含（内联 CSS/JS、无外部资源），可上严格 CSP
+          res.writeHead(200, {
+            'content-type': 'text/html; charset=utf-8',
+            'cache-control': 'no-store',
+            'x-content-type-options': 'nosniff',
+            'x-frame-options': 'DENY',
+            'referrer-policy': 'no-referrer',
+            'x-robots-tag': 'noindex, nofollow',
+            'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+          })
           res.end(page)
           return
         }
@@ -683,20 +775,34 @@ export async function apply(ctx) {
             sendJson(res, 200, { ok: false, error: 'not-configured' })
             return
           }
+          const meta = requestMeta(req)
           const now = Date.now()
           failures = failures.filter((t) => now - t < 60000)
           if (failures.length >= 5) {
+            await auditLog(ctx, 'login_rate_limited', { username: username || null, ip: meta.ip, ua: meta.ua })
             sendJson(res, 200, { ok: false, error: 'rate-limited' })
             return
           }
-          if (username === creds.username && hashPassword(creds.salt, password) === creds.hash) {
-            const s = createSession(username, ttlOf(creds))
-            res.setHeader('Set-Cookie', sessionCookie(s.token, s.maxAge))
-            sendJson(res, 200, { ok: true })
+          // 凭据校验：仅接受 scrypt 哈希（v1 SHA-256 自 0.2.0 起不再支持，
+          // 旧凭据需删除 dsh-webui-auth.json 后重新创建）。
+          // 登录不做用户名格式校验，旧账号不受新规则影响。
+          // 三种情况耗时一致（恰好 1 次 scrypt）：正确 / 密码错误 / 用户名不存在。
+          let valid = false
+          if (username === creds.username && typeof creds.hash === 'string') {
+            valid = await verifyPassword(password, creds.hash)
+          } else {
+            valid = await dummyVerify(password)
+          }
+          if (!valid) {
+            failures.push(now)
+            await auditLog(ctx, 'login_failure', { username: username || null, ip: meta.ip, ua: meta.ua })
+            sendJson(res, 200, { ok: false, error: 'invalid' })
             return
           }
-          failures.push(now)
-          sendJson(res, 200, { ok: false, error: 'invalid' })
+          const s = createSession(username, ttlOf(creds))
+          res.setHeader('Set-Cookie', sessionCookie(s.token, s.maxAge))
+          await auditLog(ctx, 'login_success', { username, ip: meta.ip, ua: meta.ua })
+          sendJson(res, 200, { ok: true })
           return
         }
         sendJson(res, 405, { error: '仅支持 GET/POST' })
@@ -716,6 +822,8 @@ export async function apply(ctx) {
           return
         }
         if (enabledFlag) {
+          const meta = requestMeta(req)
+          await auditLog(ctx, 'setup_failure', { username: null, ip: meta.ip, ua: meta.ua, detail: '已初始化，拒绝重复配置' })
           sendJson(res, 200, { ok: false, error: 'already-configured' })
           return
         }
@@ -723,21 +831,25 @@ export async function apply(ctx) {
         if (body === null) return
         const username = String(body.username || '').trim()
         const password = String(body.password || '')
-        if (!username) {
-          sendJson(res, 200, { ok: false, error: 'username-empty' })
+        const meta = requestMeta(req)
+        const nameErr = usernameError(username)
+        if (nameErr) {
+          await auditLog(ctx, 'setup_failure', { username: username || null, ip: meta.ip, ua: meta.ua, detail: '用户名格式不合法' })
+          sendJson(res, 200, { ok: false, error: 'username-invalid' })
           return
         }
         const st = passwordStrength(password)
         if (!st.ok) {
+          await auditLog(ctx, 'setup_failure', { username, ip: meta.ip, ua: meta.ua, detail: '密码强度不足' })
           sendJson(res, 200, { ok: false, error: 'weak-password', reason: st.reason })
           return
         }
-        const salt = randomSalt()
-        await writeCredentials(ctx, { v: 1, username, salt, hash: hashPassword(salt, password), ttl: TTL_DEFAULT })
+        await writeCredentials(ctx, { v: 2, username, hash: await hashPassword(password), ttl: TTL_DEFAULT })
         enabledFlag = true
         failures = []
         const s = createSession(username, TTL_DEFAULT)
         res.setHeader('Set-Cookie', sessionCookie(s.token, s.maxAge))
+        await auditLog(ctx, 'setup_success', { username, ip: meta.ip, ua: meta.ua })
         sendJson(res, 200, { ok: true })
       } catch (e) {
         sendJson(res, 500, { error: e && e.message ? e.message : String(e) })
@@ -754,8 +866,12 @@ export async function apply(ctx) {
           sendJson(res, 405, { error: '仅支持 POST' })
           return
         }
+        const token = cookieOf(req, COOKIE_NAME)
+        const s = token ? sessions.get(token) : null
         destroySession(req)
         res.setHeader('Set-Cookie', clearSessionCookie())
+        const meta = requestMeta(req)
+        await auditLog(ctx, 'logout', { username: s ? s.username : null, ip: meta.ip, ua: meta.ua })
         sendJson(res, 200, { ok: true })
       } catch (e) {
         sendJson(res, 500, { error: e && e.message ? e.message : String(e) })
@@ -792,6 +908,32 @@ export async function apply(ctx) {
 
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact',
+    path: '/dsh-webui-auth/audit',
+    handler: async (req, res) => {
+      try {
+        if (req.method !== 'GET' && req.method !== 'HEAD') {
+          sendJson(res, 405, { error: '仅支持 GET' })
+          return
+        }
+        if (enabledFlag && !checkRequest(req)) {
+          sendJson(res, 401, { error: 'unauthorized' })
+          return
+        }
+        let limit = 10
+        if (typeof req.url === 'string') {
+          const m = /[?&]limit=(\d+)/.exec(req.url)
+          if (m) limit = Math.min(Math.max(Number(m[1]), 1), 100)
+        }
+        const entries = await readAuditEntries(ctx, limit)
+        sendJson(res, 200, { ok: true, entries })
+      } catch (e) {
+        sendJson(res, 500, { error: e && e.message ? e.message : String(e) })
+      }
+    },
+  }), 'dsh-webui-auth: audit')
+
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
     path: '/dsh-webui-auth/configure',
     handler: async (req, res) => {
       try {
@@ -809,21 +951,36 @@ export async function apply(ctx) {
         const password = String(body.password || '')
         const current = String(body.current || '')
         const creds = await readCredentials(ctx)
-        if (!username) {
-          sendJson(res, 200, { ok: false, error: 'username-empty' })
+        const meta = requestMeta(req)
+        const nameErr = usernameError(username)
+        if (nameErr) {
+          await auditLog(ctx, 'configure_failure', { username: username || null, ip: meta.ip, ua: meta.ua, detail: '用户名格式不合法' })
+          sendJson(res, 200, { ok: false, error: 'username-invalid' })
           return
         }
         const wasEnabled = isEnabled(creds)
-        const keepPassword = wasEnabled && !password
+        // 仅当现有哈希是 scrypt 格式时才允许"密码留空=不修改"：
+        // 旧版 v1 哈希（非 scrypt）不能被原样保留（登录校验只认 scrypt），
+        // 此时必须提供新密码，否则账号会因哈希格式不符而无法登录。
+        const hashIsScrypt = typeof creds.hash === 'string' && creds.hash.startsWith(SCRYPT_PREFIX)
+        const keepPassword = wasEnabled && !password && hashIsScrypt
+        if (wasEnabled && !password && !hashIsScrypt) {
+          await auditLog(ctx, 'configure_failure', { username, ip: meta.ip, ua: meta.ua, detail: '旧版哈希不支持保留，必须设置新密码' })
+          sendJson(res, 200, { ok: false, error: 'legacy-hash' })
+          return
+        }
         if (!keepPassword) {
           const st = passwordStrength(password)
           if (!st.ok) {
+            await auditLog(ctx, 'configure_failure', { username, ip: meta.ip, ua: meta.ua, detail: '密码强度不足' })
             sendJson(res, 200, { ok: false, error: 'weak-password', reason: st.reason })
             return
           }
         }
         if (wasEnabled) {
-          if (!current || hashPassword(creds.salt, current) !== creds.hash) {
+          const curValid = current && typeof creds.hash === 'string' && await verifyPassword(current, creds.hash)
+          if (!curValid) {
+            await auditLog(ctx, 'configure_failure', { username, ip: meta.ip, ua: meta.ua, detail: '当前密码不正确' })
             sendJson(res, 200, { ok: false, error: 'current-invalid' })
             return
           }
@@ -836,16 +993,10 @@ export async function apply(ctx) {
             return
           }
         }
-        let salt
-        let hash
-        if (keepPassword) {
-          salt = creds.salt
-          hash = creds.hash
-        } else {
-          salt = randomSalt()
-          hash = hashPassword(salt, password)
-        }
-        await writeCredentials(ctx, { v: 1, username, salt, hash, ttl })
+        const credsOut = (keepPassword && typeof creds.hash === 'string')
+          ? { v: 2, username, hash: creds.hash, ttl }
+          : { v: 2, username, hash: await hashPassword(password), ttl }
+        await writeCredentials(ctx, credsOut)
         enabledFlag = true
         failures = []
         if (wasEnabled) {
@@ -857,6 +1008,10 @@ export async function apply(ctx) {
           const s = createSession(username, ttl)
           res.setHeader('Set-Cookie', sessionCookie(s.token, s.maxAge))
         }
+        const detailParts = []
+        if (!keepPassword) detailParts.push('密码已修改')
+        if (body.ttl !== undefined) detailParts.push('有效期已修改')
+        await auditLog(ctx, 'configure_success', { username, ip: meta.ip, ua: meta.ua, detail: detailParts.length ? detailParts.join('，') : null })
         sendJson(res, 200, { ok: true })
       } catch (e) {
         sendJson(res, 500, { error: e && e.message ? e.message : String(e) })
@@ -881,11 +1036,14 @@ export async function apply(ctx) {
         if (body === null) return
         const current = String(body.current || '')
         const creds = await readCredentials(ctx)
+        const meta = requestMeta(req)
         if (!isEnabled(creds)) {
           sendJson(res, 200, { ok: true })
           return
         }
-        if (!current || hashPassword(creds.salt, current) !== creds.hash) {
+        const curValid = current && typeof creds.hash === 'string' && await verifyPassword(current, creds.hash)
+        if (!curValid) {
+          await auditLog(ctx, 'disable_failure', { username: creds.username, ip: meta.ip, ua: meta.ua, detail: '当前密码不正确' })
           sendJson(res, 200, { ok: false, error: 'current-invalid' })
           return
         }
@@ -894,6 +1052,7 @@ export async function apply(ctx) {
         res.setHeader('Set-Cookie', clearSessionCookie())
         enabledFlag = false
         failures = []
+        await auditLog(ctx, 'disable_success', { username: creds.username, ip: meta.ip, ua: meta.ua })
         sendJson(res, 200, { ok: true })
       } catch (e) {
         sendJson(res, 500, { error: e && e.message ? e.message : String(e) })
@@ -932,4 +1091,75 @@ export async function apply(ctx) {
       }
     },
   }), 'dsh-webui-auth: transport gate')
+}
+
+// ---------------- CLI：node index.js audit [--limit N] ----------------
+//
+// 直接运行本文件时进入 CLI 模式（作为 Cordis 插件被 DSH 加载时不会触发，
+// 此时 process.argv[1] 是 DSH 入口而非本文件）。审计日志为 JSONL 追加写，
+// 位于插件目录 audit.jsonl（与凭据文件同目录）。
+//
+// 用法：
+//   node index.js audit             查看最近 20 条审计日志
+//   node index.js audit --limit 50  指定条数（1-200）
+
+let metaFilePath = null
+try {
+  let u = import.meta.url
+  const q = u.indexOf('?')
+  if (q !== -1) u = u.slice(0, q)
+  const h = u.indexOf('#')
+  if (h !== -1) u = u.slice(0, h)
+  metaFilePath = fileURLToPath(u)
+} catch (e) { /* not a file URL */ }
+
+const isCliEntry = metaFilePath !== null && (() => {
+  try {
+    const entry = process.argv[1]
+    if (!entry) return false
+    // Windows 文件系统大小写不敏感：统一小写后再比较，避免
+    // import.meta.url 与 argv[1] 的大小写差异导致 CLI 不触发
+    const self = process.platform === 'win32' ? metaFilePath.toLowerCase() : metaFilePath
+    const resolved = resolvePath(entry)
+    return (process.platform === 'win32' ? resolved.toLowerCase() : resolved) === self
+  } catch (e) {
+    return false
+  }
+})()
+
+if (isCliEntry) {
+  const cmd = process.argv[2]
+  if (cmd === 'audit') {
+    const li = process.argv.indexOf('--limit')
+    let limit = 20
+    if (li >= 0 && process.argv[li + 1] !== undefined) {
+      const n = Number(process.argv[li + 1])
+      if (Number.isFinite(n) && n > 0) limit = Math.min(Math.floor(n), 200)
+    }
+    const file = auditFileForCli()
+    const rows = []
+    if (file) {
+      try {
+        const lines = readFileSync(file, 'utf8').split('\n').filter((l) => l.trim())
+        for (let i = lines.length - 1; i >= 0 && rows.length < limit; i--) {
+          try { rows.push(JSON.parse(lines[i])) } catch (e) { /* skip malformed */ }
+        }
+      } catch (e) { /* 文件尚不存在 */ }
+    }
+    console.log('[dsh-webui-auth] 审计日志：最近 ' + rows.length + ' 条' + (file ? '（文件: ' + file + '）' : ''))
+    if (rows.length === 0) {
+      console.log('（暂无审计记录；登录/配置等安全事件会追加写入插件目录的 audit.jsonl）')
+    }
+    for (const r of rows) {
+      const parts = [r.ts || '?', r.event || '?']
+      if (r.username) parts.push('user=' + r.username)
+      if (r.ip) parts.push('ip=' + r.ip)
+      if (r.ua) parts.push('ua=' + (typeof r.ua === 'string' && r.ua.length > 60 ? r.ua.slice(0, 60) + '…' : String(r.ua)))
+      if (r.detail) parts.push('detail=' + String(r.detail))
+      console.log('  ' + parts.join('  '))
+    }
+  } else {
+    console.log('[dsh-webui-auth] 用法: node index.js audit [--limit N]')
+  }
+  process.exit(0)
 }
