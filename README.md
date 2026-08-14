@@ -19,7 +19,7 @@ Sessions are **server-side, in-memory**, carried by an `HttpOnly; SameSite=Lax` 
 
 ## Installation
 
-1. Put the `dsh-webui-auth` directory into `profiles/web/node_modules/` (next to `dsh-vision-helper`)
+1. Put the `dsh-webui-auth` directory into `profiles/web/node_modules/`
 2. Add one row to the `insert` list in `profiles/web/cordis.patch.yml`:
 
 ```yaml
