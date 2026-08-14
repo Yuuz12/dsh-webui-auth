@@ -87,13 +87,22 @@ npx @deepseek-ai/dsh plugin --profile web add github:Yuuz12/dsh-webui-auth
 - **用户名规则**：3-32 位字母、数字、下划线或连字符（新建/修改时强制；旧账号不受影响，仍可正常登录）。
 - **之后**：未登录访问任意路径 → 跳转登录页；登录后按「会话有效期」免登录（浏览器会话 / 1 小时 / 12 小时（默认）/ 1 天 / 3 天），服务端按到期时间强制失效。「浏览器会话」模式：活跃使用期间自动续期（30 分钟窗口），关闭浏览器即失效。
 - **修改 / 禁用 / 退出**：设置 → 身份认证（均需当前密码）；修改密码会吊销其他所有已登录会话。
-- **忘记密码**：删除插件目录的 `dsh-webui-auth.json` 即可——后台每分钟自动检测，最多 1 分钟内认证自动关闭（无需重启），之后重新创建账号即可。
+- **忘记密码**：删除数据目录的 `dsh-webui-auth.json` 即可——后台每分钟自动检测，最多 1 分钟内认证自动关闭（无需重启），之后重新创建账号即可。
+
+## 数据文件位置（按安装方式区分）
+
+凭据（`dsh-webui-auth.json`）与审计日志（`audit.jsonl`）存放在**运行时数据目录**：
+
+- **本地 link / 源码安装**（`dsh plugin add ./dsh-webui-auth`）：插件源码目录，卸载即清、随仓库管理；
+- **npm / GitHub / tarball 安装**（pnpm store 只读，无法在模块目录落盘）：自动回退到 `$DSH_HOME/dsh-webui-auth/`（默认 `~/.dsh/dsh-webui-auth/`）。
+
+插件启动时探测目录可写性并固定其一，两种安装方式的忘记密码/审计路径都在各自的数据目录里。
 
 ## 审计日志
 
-登录成功/失败/限流、初始化、修改凭据、禁用、退出等安全事件会**追加写入插件目录的 `audit.jsonl`**（JSONL 格式，含时间、用户名、IP、UA、详情）。两种查看方式：
+登录成功/失败/限流、初始化、修改凭据、禁用、退出等安全事件会**追加写入数据目录的 `audit.jsonl`**（JSONL 格式，含时间、用户名、IP、UA、详情；数据目录位置见下节）。两种查看方式：
 
-- **CLI**（推荐）：在插件目录运行 `node index.js audit [--limit N]`（默认最近 20 条）：
+- **CLI**（推荐）：运行 `node index.js audit [--limit N]`（默认最近 20 条，从模块所在路径运行即可）：
   ```sh
   node index.js audit --limit 50
   ```
@@ -114,7 +123,7 @@ npx @deepseek-ai/dsh plugin --profile web add github:Yuuz12/dsh-webui-auth
 
 ## 数据与安全
 
-- 密码以 **scrypt**（Node 内置内存硬 KDF，抗 GPU/ASIC 爆破，零依赖）哈希保存在插件目录 `dsh-webui-auth.json`，明文不落盘。**0.2.0 起仅接受 scrypt 哈希**：0.1.x 的 SHA-256 凭据不再可校验，需删除 `dsh-webui-auth.json` 后重新创建账号（见「忘记密码」）。
+- 密码以 **scrypt**（Node 内置内存硬 KDF，抗 GPU/ASIC 爆破，零依赖）哈希保存在数据目录的 `dsh-webui-auth.json`（位置见上节），明文不落盘。**0.2.0 起仅接受 scrypt 哈希**：0.1.x 的 SHA-256 凭据不再可校验，需删除凭据文件后重新创建账号（见「忘记密码」）。
 - 登录失败限流：1 分钟最多 5 次；校验失败时还会空跑一次 scrypt，抹平「账号不存在=响应快」的用户名枚举时序差异。
 - 审计日志：登录/配置等安全事件追加写入 `audit.jsonl`（见「审计日志」节）。
 - 登录页与 API 响应均带安全头：严格 CSP、`nosniff`、`DENY` 防嵌框、`no-referrer`、`noindex`、`no-store`。

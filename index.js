@@ -33,7 +33,9 @@
  * plugin folder. View via CLI:  node index.js audit [--limit N]
  *
  * Credentials live in the plugin's own folder (`dsh-webui-auth.json` next to
- * this module) as an scrypt hash — never plaintext.
+ * this module) when that folder is writable (link/source installs); when the
+ * module folder is read-only (npm/pnpm store installs) they fall back to
+ * `$DSH_HOME/dsh-webui-auth/`. Stored as an scrypt hash — never plaintext.
  *
  * Endpoints:
  *   GET  /dsh-webui-auth/login       login page (public, mode by enabled state)
@@ -48,7 +50,7 @@
 
 import { randomBytes, scrypt as scryptCb, timingSafeEqual } from "node:crypto";
 import { createRequire } from "node:module";
-import { readFileSync, writeFileSync, appendFileSync } from "node:fs";
+import { readFileSync, writeFileSync, appendFileSync, accessSync, mkdirSync, constants as fsConstants } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { resolve as resolvePath } from "node:path";
 import { promisify } from "node:util";
@@ -125,7 +127,7 @@ async function dummyVerify(password) {
 }
 
 // 供测试与工具脚本使用（Cordis 加载时只消费 name/inject/apply，多余导出无副作用）
-export { hashPassword, verifyPassword, auditLog, readAuditEntries }
+export { hashPassword, verifyPassword, auditLog, readAuditEntries, resolveDataDirFrom, DATA_DIR }
 
 // ---------------- 配置（凭据）存储 ----------------
 
@@ -152,13 +154,37 @@ function pluginDir() {
   return null
 }
 
-function configPath() {
-  const dir = pluginDir()
-  if (dir) return dir + '/dsh-webui-auth.json'
-  // Fallback for exotic loaders where import.meta.url is not a file URL.
+/**
+ * 运行时数据目录（凭据 + 审计日志）。
+ *
+ * 优先插件目录——link 安装/源码部署时可写，数据与模块同处一地（卸载即清、
+ * 随仓库管理）；npm/pnpm store 安装时模块目录只读（store 文件不可写），
+ * 写入会导致 500，此时回退到 $DSH_HOME/dsh-webui-auth/（DSH 自己的配置目录，
+ * 保证可写）。启动时探测一次并缓存。
+ */
+function resolveDataDirFrom(dir) {
+  if (dir) {
+    try {
+      accessSync(dir, fsConstants.W_OK)
+      return dir
+    } catch (e) { /* store/只读目录：回退 */ }
+  }
   const home = process.env.DSH_HOME
     || ((process.env.USERPROFILE || process.env.HOME || '.') + '/.dsh')
-  return home.replace(/\\/g, '/').replace(/\/+$/, '') + '/dsh-webui-auth.json'
+  return home.replace(/\\/g, '/').replace(/\/+$/, '') + '/dsh-webui-auth'
+}
+
+const DATA_DIR = resolveDataDirFrom(pluginDir())
+
+function configPath() {
+  return DATA_DIR + '/dsh-webui-auth.json'
+}
+
+/** 确保数据目录存在（回退目录首次写入前需要创建）。 */
+function ensureDataDir() {
+  try {
+    mkdirSync(DATA_DIR, { recursive: true })
+  } catch (e) { /* 目录存在或创建失败：后续写入会报错并被上层捕获 */ }
 }
 
 async function readCredentials(ctx) {
@@ -178,6 +204,7 @@ async function readCredentials(ctx) {
 }
 
 async function writeCredentials(ctx, creds) {
+  ensureDataDir()
   const target = await ctx.fs.resolve(configPath())
   await ctx.fs.writeText(target, JSON.stringify(creds), undefined, undefined, { mode: 'danger-full-access' })
 }
@@ -197,7 +224,7 @@ function usernameError(username) {
   return null
 }
 
-// ---------------- 审计日志（JSONL 追加写，位于插件目录 audit.jsonl） ----------------
+// ---------------- 审计日志（JSONL 追加写，与凭据同目录） ----------------
 //
 // 记录登录成功/失败/限流/锁定、初始化、修改、禁用、退出等安全事件。
 // 追加写不阻塞主流程：失败仅记日志，绝不影响认证本身。
@@ -206,21 +233,18 @@ function usernameError(username) {
 const AUDIT_FILE = 'audit.jsonl'
 
 function auditFileForCli() {
-  const dir = pluginDir()
-  return dir ? dir + '/' + AUDIT_FILE : null
+  return DATA_DIR + '/' + AUDIT_FILE
 }
 
 async function auditFilePath(ctx) {
-  const dir = pluginDir()
-  if (!dir) return null
   try {
     // ctx.fs.resolve 返回 { targetKey, displayPath } 对象（不是字符串），
     // 原生 node:fs 需要物理路径 displayPath；targetKey 仅供 ctx.fs 自身使用。
-    const r = await ctx.fs.resolve(dir + '/' + AUDIT_FILE)
+    const r = await ctx.fs.resolve(DATA_DIR + '/' + AUDIT_FILE)
     if (r && typeof r.displayPath === 'string') return r.displayPath
     if (r && typeof r.targetKey === 'string') return r.targetKey
   } catch (e) { /* fall through */ }
-  return dir + '/' + AUDIT_FILE
+  return DATA_DIR + '/' + AUDIT_FILE
 }
 
 /**
@@ -231,6 +255,7 @@ async function auditLog(ctx, event, fields) {
   try {
     target = await auditFilePath(ctx)
     if (!target) return
+    ensureDataDir()
     const entry = { ts: new Date().toISOString(), event }
     for (const key of Object.keys(fields || {})) {
       const v = fields[key]
