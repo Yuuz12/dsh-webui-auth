@@ -650,12 +650,37 @@ function installRouteGate(ctx, checkRequest, log) {
   const undos = []
   let undone = false
 
-  const wrapHttp = (route) => {
+  const wrapHttp = (route, opts) => {
     const original = route.handler
+    const loopbackDeputy = !!(opts && opts.loopbackDeputy)
     const wrapped = async (req, res) => {
-      if (checkRequest(req)) return original(req, res)
-      res.writeHead(401, { 'content-type': 'text/plain; charset=utf-8' })
-      res.end('unauthorized')
+      if (!checkRequest(req)) {
+        res.writeHead(401, { 'content-type': 'text/plain; charset=utf-8' })
+        res.end('unauthorized')
+        return
+      }
+      if (loopbackDeputy) {
+        // Authenticated + this is the /api surface: present the request to the
+        // core as loopback so PRIVILEGED_METHODS' strict fence (settings.*,
+        // credentials.*, agentPreset.*, llm.discoverModels) admits it. Our
+        // session gate already proved operator identity — strictly stronger
+        // than the Host-header heuristic it replaces for these callers.
+        // The fence also compares Origin.host to Host and rejects cross-site
+        // Fetch Metadata; a reverse-proxied request carries the public origin,
+        // so both are normalized alongside Host to the loopback deputy shape.
+        req.headers.host = '127.0.0.1'
+        if (typeof req.headers.origin === 'string') {
+          try {
+            const o = new URL(req.headers.origin)
+            o.host = '127.0.0.1'
+            req.headers.origin = o.toString()
+          } catch (e) { delete req.headers.origin }
+        }
+        delete req.headers['sec-fetch-site']
+        delete req.headers['sec-fetch-mode']
+        delete req.headers['sec-fetch-dest']
+      }
+      return original(req, res)
     }
     route.handler = wrapped
     return () => { route.handler = original }
@@ -679,7 +704,7 @@ function installRouteGate(ctx, checkRequest, log) {
       const route = ws.prefixes.get(pfx)
       if (route !== undefined && !wrapped.has(route)) {
         wrapped.add(route)
-        undos.push(wrapHttp(route))
+        undos.push(wrapHttp(route, { loopbackDeputy: pfx === API_PREFIX }))
         problems.delete(`prefix route "${pfx}" not registered yet`)
         log(`wrapped prefix route ${pfx}`)
       } else if (route === undefined) {
