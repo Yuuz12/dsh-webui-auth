@@ -669,13 +669,12 @@ function installRouteGate(ctx, checkRequest, log) {
         // Fetch Metadata; a reverse-proxied request carries the public origin,
         // so both are normalized alongside Host to the loopback deputy shape.
         req.headers.host = '127.0.0.1'
-        if (typeof req.headers.origin === 'string') {
-          try {
-            const o = new URL(req.headers.origin)
-            o.host = '127.0.0.1'
-            req.headers.origin = o.toString()
-          } catch (e) { delete req.headers.origin }
-        }
+        // Origin/Fetch-Metadata 一并移除：以"非浏览器回环客户端"形状呈现。
+        // 不能只改写 Origin 的 host——Host 带 127.0.0.1:3080 端口而改写后的
+        // Origin 无端口时 host 比对仍不相等（实测 403）。删除后走 fence 的
+        // 无-Origin 回环放行路径（实测 200），语义也更干净：代理后的请求
+        // 本来就不是浏览器直连。
+        delete req.headers.origin
         delete req.headers['sec-fetch-site']
         delete req.headers['sec-fetch-mode']
         delete req.headers['sec-fetch-dest']
