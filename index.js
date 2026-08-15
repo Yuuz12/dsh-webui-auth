@@ -45,7 +45,7 @@
  */
 
 import { randomBytes, scrypt as scryptCb, timingSafeEqual, createHmac } from "node:crypto";
-import { readFileSync, writeFileSync, appendFileSync, accessSync, mkdirSync, constants as fsConstants } from "node:fs";
+import { readFileSync, writeFileSync, appendFileSync, accessSync, mkdirSync, unlinkSync, constants as fsConstants } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { resolve as resolvePath } from "node:path";
 import { promisify } from "node:util";
@@ -626,6 +626,7 @@ f.addEventListener('submit', function (ev) {
 // 且 setup/configure 拒绝启用闸门（fail-closed：宁可不可用，不可裸奔）。
 
 const API_PREFIX = '/api'
+const PLUGINS_PREFIX = '/plugins'
 const MUX_PATH = '/api/events.mux'
 const HOST_PATH = '/api/events.host'
 
@@ -637,13 +638,17 @@ function rejectUpgrade401(socket) {
 }
 
 /**
- * 安装运行时路由闸门。
- * @returns {{ ok: boolean, problems: string[], undo: () => void }}
+ * 安装运行时路由闸门。带周期重扫：apply() 可能早于 client-connection 的
+ * 路由注册执行（loader 波次顺序不保证），每 2 秒重扫路由表直到全部
+ * 找到（上限 60 秒）。gate 状态动态更新，供 status 端点与 fail-closed
+ * 检查读取。
+ * @returns {{ ok: () => boolean, problems: () => string[], undo: () => void }}
  */
 function installRouteGate(ctx, checkRequest, log) {
   const ws = ctx.webServer
-  const problems = []
+  const problems = new Set()
   const undos = []
+  let undone = false
 
   const wrapHttp = (route) => {
     const original = route.handler
@@ -665,53 +670,58 @@ function installRouteGate(ctx, checkRequest, log) {
     return () => { route.handler = original }
   }
 
-  // 1) 包装已存在的 /api prefix 路由
-  let apiRoute = ws.prefixes.get(API_PREFIX)
-  if (apiRoute !== undefined) {
-    undos.push(wrapHttp(apiRoute))
-  } else {
-    problems.push(`prefix route "${API_PREFIX}" not registered yet`)
-  }
-
-  // 2) 包装已存在的 upgrade 路由
-  for (const path of [MUX_PATH, HOST_PATH]) {
-    const r = ws.upgrades.get(path)
-    if (r !== undefined) {
-      undos.push(wrapUpgrade(r))
-    } else {
-      problems.push(`upgrade route "${path}" not registered yet`)
-    }
-  }
-
-  // 3) 拦截后续注册（晚于本插件加载的路由，如 HMR 重挂载）
-  const guardMaps = (map, isUpgrade) => {
-    const originalSet = map.set.bind(map)
-    map.set = (path, route) => {
-      const hit = isUpgrade
-        ? (path === MUX_PATH || path === HOST_PATH)
-        : path === API_PREFIX
-      if (hit) {
-        const undo = isUpgrade ? wrapUpgrade(route) : wrapHttp(route)
-        undos.push(undo)
-        log(`wrapped late-registered ${isUpgrade ? 'upgrade' : 'prefix'} route ${path}`)
+  // 已包装的路由打标记，避免重复包装
+  const wrapped = new WeakSet()
+  const PROTECTED_PREFIXES = [API_PREFIX, PLUGINS_PREFIX]
+  const scanOnce = () => {
+    if (undone) return
+    for (const pfx of PROTECTED_PREFIXES) {
+      const route = ws.prefixes.get(pfx)
+      if (route !== undefined && !wrapped.has(route)) {
+        wrapped.add(route)
+        undos.push(wrapHttp(route))
+        problems.delete(`prefix route "${pfx}" not registered yet`)
+        log(`wrapped prefix route ${pfx}`)
+      } else if (route === undefined) {
+        problems.add(`prefix route "${pfx}" not registered yet`)
       }
-      return originalSet(path, route)
     }
-    const originalDelete = map.delete.bind(map)
-    map.delete = (path) => {
-      // 被删除的路由无需再恢复；保持 Map 语义
-      return originalDelete(path)
-    }
-    return () => {
-      map.set = originalSet
-      map.delete = originalDelete
+    for (const path of [MUX_PATH, HOST_PATH]) {
+      const r = ws.upgrades.get(path)
+      if (r !== undefined && !wrapped.has(r)) {
+        wrapped.add(r)
+        undos.push(wrapUpgrade(r))
+        problems.delete(`upgrade route "${path}" not registered yet`)
+        log(`wrapped upgrade route ${path}`)
+      } else if (r === undefined) {
+        problems.add(`upgrade route "${path}" not registered yet`)
+      }
     }
   }
-  undos.push(guardMaps(ws.prefixes, false))
-  undos.push(guardMaps(ws.upgrades, true))
 
-  const undo = () => { for (const u of undos.splice(0).reverse()) { try { u() } catch (e) { /* ignore */ } } }
-  return { ok: problems.length === 0, problems, undo }
+  scanOnce()
+
+  // 周期重扫：捕获晚注册（loader 波次/服务重挂载）。全找到后停止（但保留
+  // 低频兜底扫描，防止服务重建后路由对象被替换）。
+  let elapsed = 0
+  const rescan = setInterval(() => {
+    if (undone) { clearInterval(rescan); return }
+    scanOnce()
+    elapsed += 2
+    if (problems.size === 0 && elapsed > 60) {
+      // 全部就位后降频为 10s 兜底（服务 fiber 重建时路由对象会换新）
+      clearInterval(rescan)
+      const slow = setInterval(() => { if (!undone) scanOnce(); else clearInterval(slow) }, 10000)
+      undos.push(() => clearInterval(slow))
+    }
+  }, 2000)
+  undos.push(() => clearInterval(rescan))
+
+  const undo = () => {
+    undone = true
+    for (const u of undos.splice(0).reverse()) { try { u() } catch (e) { /* ignore */ } }
+  }
+  return { ok: () => problems.size === 0, problems: () => [...problems], undo }
 }
 
 // ---------------- DSH 外观偏好 ----------------
@@ -806,13 +816,19 @@ export async function apply(ctx) {
   // H2: 安装运行时路由闸门
   const gate = installRouteGate(ctx, checkRequest, (m) => ctx.logger.info('[dsh-webui-auth] ' + m))
   ctx.effect(() => gate.undo, 'dsh-webui-auth: route gate')
-  if (!gate.ok) {
-    ctx.logger.error('[dsh-webui-auth] ROUTE GATE INCOMPLETE — ' + gate.problems.join('; ')
+  if (!gate.ok()) {
+    ctx.logger.error('[dsh-webui-auth] ROUTE GATE INCOMPLETE — ' + gate.problems().join('; ')
       + '. /api and/or WebSocket may be unprotected; the gate will still wrap them if they register later.')
   }
 
   ctx.logger.info('[dsh-webui-auth] started, credentials file: ' + configPath())
   if (!enabledFlag) {
+    // H1: token 同时落盘（0600，仅本机操作者可读），setup 成功后删除。
+    // 解决 ctx.logger 输出在某些部署（systemd）下不可见的问题。
+    try {
+      ensureDataDir()
+      writeFileSync(DATA_DIR + '/setup-token', SETUP_TOKEN + '\n', { mode: 0o600 })
+    } catch (e) { /* 落盘失败时仍可从日志读取 */ }
     ctx.logger.info('[dsh-webui-auth] setup token (first-run administrator creation): ' + SETUP_TOKEN)
   }
 
@@ -935,12 +951,13 @@ export async function apply(ctx) {
           return
         }
         // H2 fail-closed：路由闸门不完整时拒绝启用认证（防止"开了登录却裸奔 /api"）
-        if (!gate.ok) {
+        if (!gate.ok()) {
           await auditLog(ctx, 'setup_failure', { username, ip: meta.ip, ua: meta.ua, detail: '路由闸门不完整，拒绝启用' })
-          sendJson(res, 200, { ok: false, error: 'gate-incomplete', problem: gate.problems[0] || '' })
+          sendJson(res, 200, { ok: false, error: 'gate-incomplete', problem: gate.problems()[0] || '' })
           return
         }
         await writeCredentials(ctx, { v: 3, username, hash: await hashPassword(password), ttl: TTL_DEFAULT })
+        try { unlinkSync(DATA_DIR + '/setup-token') } catch (e) { /* already gone */ }
         enabledFlag = true
         const s = createSession(username, TTL_DEFAULT)
         res.setHeader('Set-Cookie', sessionCookie(s.token, s.maxAge))
@@ -994,7 +1011,7 @@ export async function apply(ctx) {
           username: enabled ? creds.username : null,
           ttl: ttlOf(creds),
           sessionsPersisted: sessions.ok,
-          gate: { ok: gate.ok, problems: gate.problems.slice(0, 3) },
+          gate: { ok: gate.ok(), problems: gate.problems().slice(0, 3) },
         })
       } catch (e) {
         sendJson(res, 500, { error: e && e.message ? e.message : String(e) })
@@ -1079,9 +1096,9 @@ export async function apply(ctx) {
           }
         }
         // H2 fail-closed：闸门不完整时拒绝启用
-        if (!wasEnabled && !gate.ok) {
+        if (!wasEnabled && !gate.ok()) {
           await auditLog(ctx, 'configure_failure', { username, ip: meta.ip, ua: meta.ua, detail: '路由闸门不完整，拒绝启用' })
-          sendJson(res, 200, { ok: false, error: 'gate-incomplete', problem: gate.problems[0] || '' })
+          sendJson(res, 200, { ok: false, error: 'gate-incomplete', problem: gate.problems()[0] || '' })
           return
         }
         let ttl = wasEnabled ? ttlOf(creds) : TTL_DEFAULT
