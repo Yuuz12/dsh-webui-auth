@@ -1,55 +1,50 @@
 /**
  * dsh-webui-auth — persistent WebUI authentication plugin for DeepSeek
- * Harness (hardened build).
+ * Harness (security-hardened fork).
  *
  * Enforces authentication at the HTTP/transport layer so unauthenticated
  * browsers (or plain HTTP clients) cannot load WebUI resources, call the
- * /api RPC surface, or open the WebSocket downlinks:
+ * /api RPC surface, or open the WebSocket downlinks.
  *
- *   1. `prefix ''` fallback route intercepts every unclaimed request
- *      (index.html, /assets/*, SPA routes, unknown paths): no valid session
- *      cookie -> 302 to the login page; valid session -> hand off to the SPA
- *      fallback (frontend-static) which serves the dist.
- *   2. `prefix '/plugins/'` intercepts client plugin bundles and serves them
- *      itself after the same session check (client-modules' shorter
- *      "/plugins" route is shadowed by longest-prefix matching).
- *   3. /api RPC and the WebSocket upgrades are gated by a minimal patch in
- *      dsh-client-connection: it consults `webServer.webuiAuthGate`, which
- *      this plugin mounts on the shared webServer service instance.
- *   4. Sessions are server-side (in-memory), carried by an HttpOnly cookie
- *      `dsh_wua_session`; changing the password revokes every other session.
+ * Hardening changes over upstream 0.2.3 (by xiaoying-agent):
  *
- * First-run flow: while no credentials exist, authentication is off
- * (enabledFlag false -> everything passes). The login page then renders the
- * "create administrator account" form; creating credentials enables the gate
- * immediately and opens a session.
+ *   H1. First-run setup requires a per-boot random setup token that is only
+ *       printed to the host log (where the operator reads it). A remote
+ *       attacker who reaches the server before the operator can no longer
+ *       claim the administrator account.
+ *   H2. /api and WebSocket gating is done by RUNTIME ROUTE WRAPPING instead
+ *       of patching dsh core package sources on disk. No core files are
+ *       modified; nothing silently breaks on a dsh upgrade. If the expected
+ *       routes are missing (dsh internals changed), the plugin logs an error
+ *       AND reports it on the settings page — and the login/configure
+ *       endpoints refuse to enable the gate until the shape check passes
+ *       (fail-closed against "enabled but /api unprotected").
+ *   H3. Sessions persist to disk (JSONL append + startup replay), so a dsh
+ *       restart no longer logs everyone out.
+ *   H4. Login rate limiting is per-IP (socket remote address; honors
+ *       CF-Connecting-IP / X-Forwarded-For leftmost-untrusted strip when the
+ *       socket is a loopback reverse proxy) instead of one global bucket,
+ *       so an attacker cannot lock the operator out.
+ *   H5. The audit log stores HMAC-keyed, truncated client IPs instead of
+ *       raw addresses (the HMAC key is generated once and stored next to
+ *       the credentials with 0600 permissions).
  *
- * Password hashing: scrypt (Node built-in memory-hard KDF). Credentials written
- * by older builds (v1 salted SHA-256) are no longer verifiable — delete
- * dsh-webui-auth.json and recreate the account to upgrade (see README).
+ * Upstream credit: authentication architecture, login page, settings UI,
+ * and the scrypt credential format originate from Yuuz12/dsh-webui-auth
+ * (MIT). This fork keeps the on-disk formats compatible where possible.
  *
- * Audit log: security events (login success/failure/rate-limit, setup,
- * configure, disable, logout) are appended as JSONL to audit.jsonl in the
- * plugin folder. View via CLI:  node index.js audit [--limit N]
+ * Routes protected (all via runtime wrapping of the webServer service):
+ *   - prefix ""    : SPA resources (302 to login page)
+ *   - prefix "/plugins": client plugin bundles (302 to login page)
+ *   - prefix "/api"     : RPC surface (401)
+ *   - upgrades /api/events.mux + /api/events.host : (reject upgrade)
  *
- * Credentials live in the plugin's own folder (`dsh-webui-auth.json` next to
- * this module) when that folder is writable (link/source installs); when the
- * module folder is read-only (npm/pnpm store installs) they fall back to
- * `$DSH_HOME/dsh-webui-auth/`. Stored as an scrypt hash — never plaintext.
- *
- * Endpoints:
- *   GET  /dsh-webui-auth/login       login page (public, mode by enabled state)
- *   POST /dsh-webui-auth/login       { username, password }   -> { ok, error? }
- *   POST /dsh-webui-auth/setup       { username, password }   -> { ok, error? } (first-run only)
- *   POST /dsh-webui-auth/logout      (session required)       -> { ok }
- *   GET  /dsh-webui-auth/status      (session required)       -> { enabled, username, ttl }
- *   GET  /dsh-webui-auth/audit       (session required)       -> { ok, entries: [...] } (?limit=N)
- *   POST /dsh-webui-auth/configure   (session required) { username, password?, current, ttl? }
- *   POST /dsh-webui-auth/disable     (session required) { current }
+ * Sessions: server-side, persisted across restarts (H3), carried by an
+ * HttpOnly cookie `dsh_wua_session`; changing the password revokes every
+ * other session.
  */
 
-import { randomBytes, scrypt as scryptCb, timingSafeEqual } from "node:crypto";
-import { createRequire } from "node:module";
+import { randomBytes, scrypt as scryptCb, timingSafeEqual, createHmac } from "node:crypto";
 import { readFileSync, writeFileSync, appendFileSync, accessSync, mkdirSync, constants as fsConstants } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { resolve as resolvePath } from "node:path";
@@ -57,20 +52,11 @@ import { promisify } from "node:util";
 
 export const name = 'dsh-webui-auth'
 
-export const inject = ['webServer', 'fs', 'clientModules']
+export const inject = ['webServer', 'fs']
 
-// ---------------- 密码哈希：scrypt（Node 内置内存硬 KDF，零依赖） ----------------
-//
-// 取代旧版手写 SHA-256：SHA-256 极快，GPU 上每秒可算数十亿次，加盐也无济于事；
-// scrypt 是内存硬 KDF（计算需占用大量内存，难以并行/ASIC 加速），是 Node 官方
-// 推荐的口令哈希方案（npm 自身认证体系即用它）。
-//
-// 存储格式（自描述，参数可随版本调整）：
-//   "scrypt:N:r:p:saltB64:hashB64"
-// 注意：旧版 v1 凭据（SHA-256）自 0.2.0 起不再支持校验，需删除
-// dsh-webui-auth.json 后重新创建账号（见 README「忘记密码」）。
+// ---------------- 密码哈希：scrypt（与上游相同的参数与存储格式） ----------------
 
-const SCRYPT_N = 32768          // 2^15，约 32 MiB 内存
+const SCRYPT_N = 32768
 const SCRYPT_R = 8
 const SCRYPT_P = 1
 const SCRYPT_KEYLEN = 64
@@ -79,14 +65,12 @@ const SCRYPT_PREFIX = 'scrypt:'
 
 const scrypt = promisify(scryptCb)
 
-/** 生成新密码哈希（含随机盐），格式见上。 */
 async function hashPassword(password) {
   const salt = randomBytes(16).toString('base64')
   const derived = await scrypt(password, salt, SCRYPT_KEYLEN, { N: SCRYPT_N, r: SCRYPT_R, p: SCRYPT_P, maxmem: SCRYPT_MAXMEM })
   return SCRYPT_PREFIX + SCRYPT_N + ':' + SCRYPT_R + ':' + SCRYPT_P + ':' + salt + ':' + derived.toString('base64')
 }
 
-/** 校验 scrypt 哈希（恒定时间比较）。格式异常一律返回 false，绝不抛错。 */
 async function verifyPassword(password, stored) {
   if (typeof stored !== 'string' || !stored.startsWith(SCRYPT_PREFIX)) return false
   const parts = stored.split(':')
@@ -106,16 +90,11 @@ async function verifyPassword(password, stored) {
   }
 }
 
-/**
- * 时序均衡：用户名不存在/哈希格式不符时，对固定 dummy 哈希做一次与真实
- * 校验等价的 scrypt 验证（结果恒为 false），使"账号不存在"与"密码错误"
- * 的响应耗时一致，抹平用户名枚举差异。
- */
 let dummyHashPromise = null
 function dummyHash() {
   if (dummyHashPromise === null) {
     dummyHashPromise = hashPassword(randomBytes(8).toString('hex')).catch((e) => {
-      dummyHashPromise = null // 生成失败可重试，不永久卡死
+      dummyHashPromise = null
       throw e
     })
   }
@@ -123,19 +102,11 @@ function dummyHash() {
 }
 async function dummyVerify(password) {
   const h = await dummyHash()
-  return verifyPassword(password, h) // 恒 false，但成本与真实校验一致（恰好 1 次 scrypt）
+  return verifyPassword(password, h)
 }
 
-// 供测试与工具脚本使用（Cordis 加载时只消费 name/inject/apply，多余导出无副作用）
-export { hashPassword, verifyPassword, auditLog, readAuditEntries, resolveDataDirFrom, DATA_DIR }
+// ---------------- 数据目录与文件 ----------------
 
-// ---------------- 配置（凭据）存储 ----------------
-
-/**
- * The plugin's own directory, derived from import.meta.url (pure string ops,
- * no imports). The credentials document lives next to the module so
- * uninstalling the plugin folder leaves no residue.
- */
 function pluginDir() {
   try {
     let url = import.meta.url
@@ -145,7 +116,7 @@ function pluginDir() {
     if (h !== -1) url = url.slice(0, h)
     if (url.startsWith('file://')) {
       let p = url.slice('file://'.length)
-      if (/^\/[A-Za-z]:\//.test(p)) p = p.slice(1) // Windows: '/C:/...' -> 'C:/...'
+      if (/^\/[A-Za-z]:\//.test(p)) p = p.slice(1)
       p = decodeURIComponent(p)
       const slash = p.lastIndexOf('/')
       if (slash > 0) return p.slice(0, slash)
@@ -154,14 +125,6 @@ function pluginDir() {
   return null
 }
 
-/**
- * 运行时数据目录（凭据 + 审计日志）。
- *
- * 优先插件目录——link 安装/源码部署时可写，数据与模块同处一地（卸载即清、
- * 随仓库管理）；npm/pnpm store 安装时模块目录只读（store 文件不可写），
- * 写入会导致 500，此时回退到 $DSH_HOME/dsh-webui-auth/（DSH 自己的配置目录，
- * 保证可写）。启动时探测一次并缓存。
- */
 function resolveDataDirFrom(dir) {
   if (dir) {
     try {
@@ -180,7 +143,16 @@ function configPath() {
   return DATA_DIR + '/dsh-webui-auth.json'
 }
 
-/** 确保数据目录存在（回退目录首次写入前需要创建）。 */
+/** H3: 会话持久化文件（JSONL，一行一个会话）。 */
+function sessionsPath() {
+  return DATA_DIR + '/sessions.jsonl'
+}
+
+/** H5: HMAC 密钥文件，用于审计 IP 的假名化。 */
+function hmacKeyPath() {
+  return DATA_DIR + '/audit-hmac-key'
+}
+
 function ensureDataDir() {
   try {
     mkdirSync(DATA_DIR, { recursive: true })
@@ -213,8 +185,6 @@ function isEnabled(creds) {
   return !!(creds && typeof creds.username === 'string' && typeof creds.hash === 'string')
 }
 
-// 用户名约束：3-32 位字母、数字、下划线或连字符。
-// 登录/验证时不做格式校验（旧账号不受影响），仅在新建/修改凭据时强制。
 const USERNAME_RE = /^[A-Za-z0-9_-]{3,32}$/
 
 function usernameError(username) {
@@ -224,11 +194,7 @@ function usernameError(username) {
   return null
 }
 
-// ---------------- 审计日志（JSONL 追加写，与凭据同目录） ----------------
-//
-// 记录登录成功/失败/限流/锁定、初始化、修改、禁用、退出等安全事件。
-// 追加写不阻塞主流程：失败仅记日志，绝不影响认证本身。
-// 查看：node index.js audit [--limit N]（CLI 模式，见文件末尾）。
+// ---------------- 审计日志（H5：IP 假名化） ----------------
 
 const AUDIT_FILE = 'audit.jsonl'
 
@@ -238,8 +204,6 @@ function auditFileForCli() {
 
 async function auditFilePath(ctx) {
   try {
-    // ctx.fs.resolve 返回 { targetKey, displayPath } 对象（不是字符串），
-    // 原生 node:fs 需要物理路径 displayPath；targetKey 仅供 ctx.fs 自身使用。
     const r = await ctx.fs.resolve(DATA_DIR + '/' + AUDIT_FILE)
     if (r && typeof r.displayPath === 'string') return r.displayPath
     if (r && typeof r.targetKey === 'string') return r.targetKey
@@ -248,8 +212,47 @@ async function auditFilePath(ctx) {
 }
 
 /**
- * 追加一条审计事件。fields 中的值必须是字符串/数字/null。
+ * H5: 审计 IP 假名化。HMAC-SHA256(key, ip) 取前 8 hex，再附 /24（IPv4）
+ * 或 /64（IPv6）网络前缀明文，便于聚合分析同时不落原始地址。
+ * 密钥文件首次生成，0600，与凭据同目录。
  */
+function auditHmacKey() {
+  const kp = hmacKeyPath()
+  try {
+    const existing = readFileSync(kp, 'utf8').trim()
+    if (existing.length >= 32) return existing
+  } catch (e) { /* not present yet */ }
+  ensureDataDir()
+  const key = randomBytes(32).toString('hex')
+  try {
+    writeFileSync(kp, key + '\n', { mode: 0o600 })
+    return key
+  } catch (e) {
+    return 'fallback-key-unavailable-' + key.slice(0, 8)
+  }
+}
+
+function anonymizeIp(ip) {
+  if (!ip || typeof ip !== 'string') return null
+  let pseudo = null
+  try {
+    pseudo = createHmac('sha256', auditHmacKey()).update(ip).digest('hex').slice(0, 8)
+  } catch (e) {
+    pseudo = 'err'
+  }
+  // 网络 /24 或 /64 前缀（聚合分析用）
+  let net = null
+  if (ip.includes('.')) {
+    const parts = ip.split('.').slice(0, 3).join('.')
+    net = parts + '.0/24'
+  } else {
+    const clean = ip.replace(/^::ffff:/, '')
+    const groups = clean.split(':').slice(0, 4).join(':')
+    net = groups + '::/64'
+  }
+  return `hmac:${pseudo}|${net}`
+}
+
 async function auditLog(ctx, event, fields) {
   let target = null
   try {
@@ -258,8 +261,9 @@ async function auditLog(ctx, event, fields) {
     ensureDataDir()
     const entry = { ts: new Date().toISOString(), event }
     for (const key of Object.keys(fields || {})) {
-      const v = fields[key]
+      let v = fields[key]
       if (v === undefined) continue
+      if (key === 'ip' && typeof v === 'string') v = anonymizeIp(v)
       entry[key] = typeof v === 'string' || typeof v === 'number' ? v : String(v)
     }
     appendFileSync(target, JSON.stringify(entry) + '\n', 'utf8')
@@ -273,14 +277,26 @@ async function auditLog(ctx, event, fields) {
 function requestMeta(req) {
   let ip = null
   try { ip = req.socket && req.socket.remoteAddress ? String(req.socket.remoteAddress) : null } catch (e) { /* ignore */ }
+  // H4: 反代场景取真实客户端 IP。仅当 socket 是回环（本机 caddy/cloudflared）时信任代理头，
+  // 且取 X-Forwarded-For 最左侧（最初的客户端），CF-Connecting-IP 次之。
+  if (ip && (ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1')) {
+    try {
+      const cf = req.headers['cf-connecting-ip']
+      if (typeof cf === 'string' && cf.trim()) {
+        ip = cf.trim()
+      } else {
+        const xff = req.headers['x-forwarded-for']
+        if (typeof xff === 'string' && xff.trim()) {
+          ip = xff.split(',')[0].trim() || ip
+        }
+      }
+    } catch (e) { /* keep socket address */ }
+  }
   let ua = null
   try { ua = typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'] : null } catch (e) { /* ignore */ }
   return { ip, ua }
 }
 
-/**
- * 读取最近 limit 条审计记录（新→旧）。文件缺失/损坏时返回空数组，绝不抛错。
- */
 async function readAuditEntries(ctx, limit) {
   let target = null
   try {
@@ -297,16 +313,16 @@ async function readAuditEntries(ctx, limit) {
   }
 }
 
-// 认证有效期（小时）：0 = 浏览器会话（关闭浏览器后失效）
+// ---------------- 会话有效期 / 密码强度 ----------------
+
 const TTL_OPTIONS = [0, 1, 12, 24, 72]
 const TTL_DEFAULT = 12
-const SESSION_BROWSER_TTL_MS = 30 * 60 * 1000 // ttl=0 时服务端兜底有效期
+const SESSION_BROWSER_TTL_MS = 30 * 60 * 1000
 
 function ttlOf(creds) {
   return (creds && typeof creds.ttl === 'number' && TTL_OPTIONS.includes(creds.ttl)) ? creds.ttl : TTL_DEFAULT
 }
 
-// 密码强度：至少 8 位，必须包含小写、大写、数字和特殊符号
 const SPECIAL_CHARS = /[!@#$%^&*()_+\-=\[\]{}|;:,.<>?/~]/
 
 function passwordStrength(p) {
@@ -361,7 +377,7 @@ function cookieOf(req, name) {
   return null
 }
 
-// ---------------- 会话管理（服务端内存） ----------------
+// ---------------- 会话管理（H3：持久化到磁盘） ----------------
 
 const COOKIE_NAME = 'dsh_wua_session'
 
@@ -375,32 +391,78 @@ function clearSessionCookie() {
   return COOKIE_NAME + '=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0'
 }
 
-// ---------------- DSH 外观偏好（浅色 / 深色 / 跟随系统） ----------------
-//
-// 复用 DSH 自带的外观设置：settings 命名空间 `ui-theme` 的 preference 字段
-// （与 @deepseek-ai/dsh-client-ui-theme 的 THEME_SETTINGS_NAMESPACE /
-// DEFAULT_PREFERENCE 完全一致），不新增独立外观开关。登录页是独立页面，
-// 加载不到 WebUI 的主题样式表，因此由服务端把当前偏好注入页面
-// （__THEME_PREFERENCE__），页面内嵌 design-platform 别名 token 子集并
-// 复刻 DSH 的 bootThemeScript：light → 浅色；dark → 深色；system → 按
-// prefers-color-scheme 实时跟随系统。
-const THEME_NAMESPACE = 'ui-theme'
-const THEME_PREFERENCE_DEFAULT = 'system'
+/**
+ * H3: 持久化会话存储。
+ * - 内存 Map 为热路径；每次创建/删除都追加 JSONL 事件（add/remove），启动时重放恢复。
+ * - 重放规则：按行序应用 add/remove；过期的会话在重放时丢弃。
+ * - 文件损坏（个别行解析失败）跳过该行，不影响其余会话。
+ */
+class PersistentSessions {
+  constructor() {
+    this.live = new Map()
+    this.ok = true // 持久化通道健康标志（写失败置 false，不影响认证本身）
+  }
 
-function themePreference(ctx) {
-  try {
-    const settings = ctx.get('settings')
-    if (settings === undefined) return THEME_PREFERENCE_DEFAULT
-    const section = settings.get(THEME_NAMESPACE)
-    if (section === undefined) return THEME_PREFERENCE_DEFAULT
-    const preference = section.preference
-    return (preference === 'light' || preference === 'dark') ? preference : THEME_PREFERENCE_DEFAULT
-  } catch (e) {
-    return THEME_PREFERENCE_DEFAULT
+  load() {
+    let lines = []
+    try {
+      lines = readFileSync(sessionsPath(), 'utf8').split('\n').filter((l) => l.trim())
+    } catch (e) { return /* 无文件 = 全新状态 */ }
+    for (const line of lines) {
+      let ev = null
+      try { ev = JSON.parse(line) } catch (e) { continue }
+      if (!ev || typeof ev.op !== 'string' || typeof ev.token !== 'string') continue
+      if (ev.op === 'add' && ev.sess && typeof ev.sess === 'object') {
+        const s = { username: String(ev.sess.username || ''), expiresAt: Number(ev.sess.expiresAt) || 0, browser: !!ev.sess.browser }
+        if (s.expiresAt > Date.now()) this.live.set(ev.token, s)
+      } else if (ev.op === 'remove') {
+        this.live.delete(ev.token)
+      } else if (ev.op === 'clear') {
+        this.live.clear()
+      }
+    }
+  }
+
+  append(ev) {
+    try {
+      ensureDataDir()
+      appendFileSync(sessionsPath(), JSON.stringify(ev) + '\n', 'utf8')
+      this.ok = true
+    } catch (e) {
+      this.ok = false // 磁盘写失败：认证继续，仅丢失重启恢复能力
+    }
+  }
+
+  // 压缩：live 状态整体重写（启动时调用一次，防止文件无限增长）
+  compact() {
+    try {
+      ensureDataDir()
+      const out = []
+      const now = Date.now()
+      for (const [token, s] of this.live) {
+        if (s.expiresAt > now) out.push({ op: 'add', token, sess: s })
+      }
+      writeFileSync(sessionsPath(), out.map((e) => JSON.stringify(e)).join('\n') + (out.length ? '\n' : ''), 'utf8')
+    } catch (e) { /* 压缩失败不影响运行 */ }
+  }
+
+  get(token) { return this.live.get(token) }
+  has(token) { return this.live.has(token) }
+  delete(token) {
+    this.live.delete(token)
+    this.append({ op: 'remove', token })
+  }
+  set(token, sess) {
+    this.live.set(token, sess)
+    this.append({ op: 'add', token, sess })
+  }
+  clear() {
+    this.live.clear()
+    this.append({ op: 'clear', token: '*' })
   }
 }
 
-// ---------------- 登录页（内联，不依赖 WebUI bundle） ----------------
+// ---------------- 登录页（与上游一致，追加 setup-token 输入框） ----------------
 
 const LOGIN_PAGE = `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -410,10 +472,6 @@ const LOGIN_PAGE = `<!DOCTYPE html>
 <meta name="color-scheme" content="light dark">
 <title>DSH WebUI 认证</title>
 <style>
-  /* DSH design-platform 别名 token 子集（逐项镜像 @deepseek-ai/dsh-client-ui-theme
-     lib/styles/design-platform.css）。登录页独立于 WebUI，无法加载其主题样式表，
-     故内嵌本页用到的 token：浅色定义在 body，深色定义在 body[data-ds-dark-theme]，
-     切换机制与 WebUI 完全一致（属性由下方 boot 脚本按 DSH 外观偏好设置）。 */
   body {
     --dsw-alias-bg-base: rgb(255, 255, 255);
     --dsw-alias-bg-layer-1: rgb(255, 255, 255);
@@ -424,8 +482,6 @@ const LOGIN_PAGE = `<!DOCTYPE html>
     --dsw-alias-label-secondary: rgb(97, 102, 107);
     --dsw-alias-brand-primary: rgb(15, 17, 21);
     --dsw-alias-state-error-primary: rgb(236, 19, 19);
-    --dsw-alias-state-success-primary: rgb(34, 197, 94);
-    --dsw-alias-state-warn-primary: rgb(245, 158, 11);
   }
   body[data-ds-dark-theme] {
     --dsw-alias-bg-base: rgb(21, 21, 23);
@@ -437,8 +493,6 @@ const LOGIN_PAGE = `<!DOCTYPE html>
     --dsw-alias-label-secondary: rgb(207, 211, 214);
     --dsw-alias-brand-primary: rgb(249, 250, 251);
     --dsw-alias-state-error-primary: rgb(242, 90, 90);
-    --dsw-alias-state-success-primary: rgb(34, 197, 94);
-    --dsw-alias-state-warn-primary: rgb(245, 158, 11);
   }
   body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
     background: var(--dsw-alias-bg-base, #f7f7f8); font-family: system-ui, -apple-system, 'Segoe UI', sans-serif; }
@@ -451,8 +505,6 @@ const LOGIN_PAGE = `<!DOCTYPE html>
   input { box-sizing: border-box; width: 100%; padding: 7px 9px; font-size: 13px; color: var(--dsw-alias-label-primary, #222);
     background: var(--dsw-alias-bg-layer-2, #fff); border: 1px solid var(--dsw-alias-border-l1, #ccc); border-radius: 4px; outline: none; }
   input:focus { border-color: var(--dsw-alias-brand-primary, #4a7cf7); }
-  /* 深色模式下浏览器自动填充会把输入框刷成白色/黄色：用 inset 大阴影 + text-fill-color
-     回压为当前主题的输入底色（与 DSH 主题 token 联动，明暗模式都正确） */
   input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:focus {
     -webkit-text-fill-color: var(--dsw-alias-label-primary, #222);
     -webkit-box-shadow: 0 0 0 1000px var(--dsw-alias-bg-layer-2, #fff) inset;
@@ -467,14 +519,11 @@ const LOGIN_PAGE = `<!DOCTYPE html>
   .err { display: none; margin: 10px 0 0; font-size: 12px; color: var(--dsw-alias-state-error-primary, #d1242f); }
   .hint { margin: 14px 0 0; font-size: 12px; line-height: 1.6; color: var(--dsw-alias-label-secondary, #888);
     border-top: 1px solid var(--dsw-alias-border-l1, #e5e5e5); padding-top: 10px; }
+  .token-row { display: none; }
 </style>
 </head>
 <body>
 <script>
-/* DSH 外观偏好（服务端注入：light / dark / system）。
-   与 WebUI 的 bootThemeScript 同一逻辑：system 时按系统 prefers-color-scheme
-   解析并实时响应系统切换；结果以 body 上的 data-ds-dark-theme 驱动上面的
-   token 选择器，与 DSH 内置外观设置保持一致。 */
 (function () {
   var preference = "__THEME_PREFERENCE__";
   if (preference !== 'light' && preference !== 'dark') preference = 'system';
@@ -496,6 +545,10 @@ const LOGIN_PAGE = `<!DOCTYPE html>
   <h1>DSH WebUI</h1>
   <p class="sub" id="sub"></p>
   <form id="f">
+    <div class="token-row" id="tokenrow">
+      <label for="t">初始化令牌（见 dsh 启动日志）</label>
+      <input id="t" type="password" autocomplete="off" spellcheck="false">
+    </div>
     <label for="u">用户名</label>
     <input id="u" type="text" autocomplete="username" autofocus spellcheck="false">
     <label for="p" id="pl">密码</label>
@@ -507,18 +560,17 @@ const LOGIN_PAGE = `<!DOCTYPE html>
     <button id="b" type="submit">登录</button>
     <p class="err" id="e"></p>
   </form>
-  <p class="hint">忘记密码：删除插件目录的 dsh-webui-auth.json 文件即可重置。</p>
+  <p class="hint">忘记密码：删除插件数据目录的 dsh-webui-auth.json 文件即可重置。</p>
 </div>
 <script>
 var MODE = "__MODE__";
-var sub = document.getElementById('sub'), pl = document.getElementById('pl'),
-  pc = document.getElementById('pc'), e = document.getElementById('e'),
-  u = document.getElementById('u'), p = document.getElementById('p'),
-  p2 = document.getElementById('p2'), b = document.getElementById('b'),
-  f = document.getElementById('f');
+var sub = document.getElementById('sub'), pl = document.getElementById('pl'), pc = document.getElementById('pc'), e = document.getElementById('e'),
+  u = document.getElementById('u'), p = document.getElementById('p'), p2 = document.getElementById('p2'), b = document.getElementById('b'),
+  f = document.getElementById('f'), t = document.getElementById('t'), tokenrow = document.getElementById('tokenrow');
 function show(msg) { e.textContent = msg; e.style.display = 'block'; }
 if (MODE === 'setup') {
-  sub.textContent = '首次使用：创建管理员账号密码，之后访问 WebUI 需要登录。';
+  sub.textContent = '首次使用：输入初始化令牌并创建管理员账号密码，之后访问 WebUI 需要登录。';
+  tokenrow.style.display = 'block';
   pl.textContent = '密码（至少 8 位，含大小写、数字、特殊符号）';
   pc.style.display = 'block';
   b.textContent = '创建账号';
@@ -528,8 +580,9 @@ if (MODE === 'setup') {
 function validUsername(name) { return /^[A-Za-z0-9_-]{3,32}$/.test(name); }
 f.addEventListener('submit', function (ev) {
   ev.preventDefault();
-  var username = u.value.trim(), password = p.value;
+  var username = u.value.trim(), password = p.value, token = t ? t.value.trim() : '';
   if (MODE === 'setup') {
+    if (!token) return show('请输入初始化令牌（dsh 启动日志中查找 [dsh-webui-auth] setup token）');
     if (!validUsername(username)) return show('用户名需为 3-32 位字母、数字、下划线或连字符');
     if (password.length < 8) return show('密码至少需要 8 位');
     if (!/[a-z]/.test(password)) return show('密码必须包含小写字母');
@@ -539,13 +592,15 @@ f.addEventListener('submit', function (ev) {
     if (password !== p2.value) return show('两次输入的密码不一致');
   }
   b.disabled = true; b.textContent = '请稍候…';
+  var body = { username: username, password: password };
+  if (MODE === 'setup') body.token = token;
   fetch(MODE === 'setup' ? '/dsh-webui-auth/setup' : '/dsh-webui-auth/login', {
-    method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: username, password: password })
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body)
   }).then(function (r) { return r.json(); }).then(function (r) {
     if (r && r.ok) { location.href = '/'; return; }
     b.disabled = false; b.textContent = MODE === 'setup' ? '创建账号' : '登录';
     if (r && r.error === 'rate-limited') show('尝试次数过多，请一分钟后重试');
+    else if (r && r.error === 'setup-token-required') show('初始化令牌缺失或不正确（见 dsh 启动日志）');
     else if (r && r.error === 'weak-password') show('密码强度不足：至少 8 位，需包含大小写字母、数字和特殊符号');
     else if (r && r.error === 'username-invalid') show('用户名需为 3-32 位字母、数字、下划线或连字符');
     else if (r && r.error === 'not-configured') show('凭据尚未配置，请刷新页面后重新创建');
@@ -560,147 +615,127 @@ f.addEventListener('submit', function (ev) {
 </body>
 </html>`
 
-// ---------------- 核心包补丁自检与自动重打 ----------------
+// ---------------- H2: 运行时路由包装（零核心补丁） ----------------
 //
-// /api 与 WebSocket 的会话闸门需要修改 DSH 核心包源码。升级 DSH（npx 拉取
-// 新版本）会覆盖这些文件，导致闸门静默失效。插件启动时检测补丁标记
-// `[dsh-webui-auth patch]`，缺失且锚点匹配则自动重新插入；锚点不匹配
-// （核心包重构）则明确记录错误，不再静默失效。
+// /api 与 WebSocket 的会话闸门通过包装 webServer 服务的路由表实现：
+// 1. 对已注册的 /api prefix 路由与 /api/events.* upgrade 路由做 handler 原地包装；
+// 2. 同时替换 prefixes/upgrades 为带拦截的 Map，捕获后续注册（如热重载/插件管理器）；
+// 3. 卸载（effect disposer）时恢复原始 handler 与原始 Map —— 完全可逆。
+//
+// 若找不到预期路由（dsh 内部结构变化），shapeCheck 失败并明确报错，
+// 且 setup/configure 拒绝启用闸门（fail-closed：宁可不可用，不可裸奔）。
 
-export const CORE_PATCHES = [
-  {
-    pkg: '@deepseek-ai/dsh-client-connection',
-    marker: '// [dsh-webui-auth patch] optional session gate — the persistent plugin',
-    anchor: 'await bridge(req, res, fetchHandler, maxRequestBodyBytes);',
-    insert: '\t\t\t// [dsh-webui-auth patch] optional session gate — the persistent plugin\n'
-      + '\t\t\t// dsh-webui-auth plugin mounts webServer.webuiAuthGate when WebUI\n'
-      + '\t\t\t// authentication is enabled; unauthorized callers get 401.\n'
-      + '\t\t\tconst authGate = ctx.webServer["webuiAuthGate"];\n'
-      + '\t\t\tif (authGate !== void 0 && !authGate.checkRequest(req)) {\n'
-      + '\t\t\t\tres.writeHead(401);\n'
-      + '\t\t\t\tres.end("unauthorized");\n'
-      + '\t\t\t\treturn;\n'
-      + '\t\t\t}\n'
-      + '\t\t\t',
-  },
-  {
-    pkg: '@deepseek-ai/dsh-client-connection',
-    marker: '// [dsh-webui-auth patch] optional session gate — same hook as',
-    anchor: 'return handle(req, socket, head);',
-    insert: '\t\t\t\t\t// [dsh-webui-auth patch] optional session gate — same hook as\n'
-      + '\t\t\t\t\t// the /api route; unauthorized WebSocket upgrades are rejected.\n'
-      + '\t\t\t\t\tconst authGate = apiCtx.webServer["webuiAuthGate"];\n'
-      + '\t\t\t\t\tif (authGate !== void 0 && !authGate.checkRequest(req)) {\n'
-      + '\t\t\t\t\t\trejectWebSocketUpgrade(socket);\n'
-      + '\t\t\t\t\t\treturn;\n'
-      + '\t\t\t\t\t}\n'
-      + '\t\t\t\t\t',
-  },
-  {
-    pkg: '@deepseek-ai/dsh-client-modules',
-    marker: '// [dsh-webui-auth patch] optional bundle gate — the persistent plugin',
-    after: true, // serveBundle 是方法定义行：补丁须插入在其后的方法体内
-    anchor: 'serveBundle = async (req, res) => {',
-    insert: '\n\t\t// [dsh-webui-auth patch] optional bundle gate — the persistent plugin\n'
-      + '\t\t// dsh-webui-auth plugin mounts webServer.webuiAuthGate when WebUI\n'
-      + '\t\t// authentication is enabled; unauthenticated bundle requests redirect\n'
-      + '\t\t// to the login page.\n'
-      + '\t\tconst authGate = this.ctx.webServer["webuiAuthGate"];\n'
-      + '\t\tif (authGate !== void 0 && !authGate.checkRequest(req)) {\n'
-      + '\t\t\tres.writeHead(302, { location: "/dsh-webui-auth/login" });\n'
-      + '\t\t\tres.end();\n'
-      + '\t\t\treturn;\n'
-      + '\t\t}\n'
-      + '\t\t',
-  },
-]
+const API_PREFIX = '/api'
+const MUX_PATH = '/api/events.mux'
+const HOST_PATH = '/api/events.host'
 
-/**
- * 对单个文件应用补丁。
- * @returns 'skip'（已带该补丁标记）| 'reapplied'（本次重新插入）| 'error'（失败）
- */
-export function applyCorePatch(file, patch, logger) {
-  let src
+function rejectUpgrade401(socket) {
   try {
-    src = readFileSync(file, 'utf8')
-  } catch (e) {
-    logger.error('[dsh-webui-auth] cannot read ' + file + ': ' + (e && e.message ? e.message : String(e)))
-    return 'error'
-  }
-  if (src.indexOf(patch.marker) !== -1) return 'skip' // 该补丁已存在
-  const at = src.indexOf(patch.anchor)
-  if (at === -1) {
-    logger.error('[dsh-webui-auth] PATCH ANCHOR NOT FOUND in ' + file + ' (' + patch.pkg + ') — /api and WebSocket are NOT protected! DSH may have upgraded; apply the patch manually.')
-    return 'error'
-  }
-  if (src.indexOf(patch.anchor, at + patch.anchor.length) !== -1) {
-    logger.error('[dsh-webui-auth] patch anchor not unique in ' + file + ' (' + patch.pkg + ') — refusing to patch automatically.')
-    return 'error'
-  }
-  const insertAt = patch.after === true ? at + patch.anchor.length : at
-  try {
-    writeFileSync(file, src.slice(0, insertAt) + patch.insert + src.slice(insertAt))
-  } catch (e) {
-    logger.error('[dsh-webui-auth] cannot write patch to ' + file + ': ' + (e && e.message ? e.message : String(e)))
-    return 'error'
-  }
-  logger.warn('[dsh-webui-auth] re-applied core patch to ' + file + ' — takes effect on next DSH start')
-  return 'reapplied'
+    socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 13\r\n\r\nunauthorized\n')
+  } catch (e) { /* ignore */ }
+  try { socket.destroy() } catch (e) { /* ignore */ }
 }
 
 /**
- * 解析核心包入口文件并逐项应用补丁。
- * 报错双通道：宿主日志（控制台）输出 + 返回汇总供 WebUI 设置页展示。
- * @returns {{ ok: boolean, reapplied: boolean, problems: string[] }}
+ * 安装运行时路由闸门。
+ * @returns {{ ok: boolean, problems: string[], undo: () => void }}
  */
-export function ensureCorePatches(ctx) {
-  const realLogger = ctx.logger || console
+function installRouteGate(ctx, checkRequest, log) {
+  const ws = ctx.webServer
   const problems = []
-  let reapplied = false
-  const logger = {
-    error(msg) {
-      try { realLogger.error(msg) } catch (e) { /* ignore */ }
-      problems.push(msg)
-    },
-    warn(msg) {
-      try { realLogger.warn(msg) } catch (e) { /* ignore */ }
-    },
-    info(msg) {
-      try { realLogger.info(msg) } catch (e) { /* ignore */ }
-    },
-  }
-  let req
-  try {
-    req = createRequire(ctx.baseUrl)
-  } catch (e) {
-    logger.error('[dsh-webui-auth] cannot create module resolver; core patches not verified — /api and WebSocket may be unprotected.')
-    return { ok: false, reapplied: false, problems }
-  }
-  for (const patch of CORE_PATCHES) {
-    let file
-    try {
-      file = req.resolve(patch.pkg)
-    } catch (e) {
-      logger.error('[dsh-webui-auth] cannot resolve ' + patch.pkg + ' — /api and WebSocket are NOT protected.')
-      continue
+  const undos = []
+
+  const wrapHttp = (route) => {
+    const original = route.handler
+    const wrapped = async (req, res) => {
+      if (checkRequest(req)) return original(req, res)
+      res.writeHead(401, { 'content-type': 'text/plain; charset=utf-8' })
+      res.end('unauthorized')
     }
-    const result = applyCorePatch(file, patch, logger)
-    if (result === 'reapplied') reapplied = true
+    route.handler = wrapped
+    return () => { route.handler = original }
   }
-  return { ok: problems.length === 0, reapplied, problems }
+  const wrapUpgrade = (route) => {
+    const original = route.handler
+    const wrapped = (req, socket, head) => {
+      if (checkRequest(req)) return original(req, socket, head)
+      rejectUpgrade401(socket)
+    }
+    route.handler = wrapped
+    return () => { route.handler = original }
+  }
+
+  // 1) 包装已存在的 /api prefix 路由
+  let apiRoute = ws.prefixes.get(API_PREFIX)
+  if (apiRoute !== undefined) {
+    undos.push(wrapHttp(apiRoute))
+  } else {
+    problems.push(`prefix route "${API_PREFIX}" not registered yet`)
+  }
+
+  // 2) 包装已存在的 upgrade 路由
+  for (const path of [MUX_PATH, HOST_PATH]) {
+    const r = ws.upgrades.get(path)
+    if (r !== undefined) {
+      undos.push(wrapUpgrade(r))
+    } else {
+      problems.push(`upgrade route "${path}" not registered yet`)
+    }
+  }
+
+  // 3) 拦截后续注册（晚于本插件加载的路由，如 HMR 重挂载）
+  const guardMaps = (map, isUpgrade) => {
+    const originalSet = map.set.bind(map)
+    map.set = (path, route) => {
+      const hit = isUpgrade
+        ? (path === MUX_PATH || path === HOST_PATH)
+        : path === API_PREFIX
+      if (hit) {
+        const undo = isUpgrade ? wrapUpgrade(route) : wrapHttp(route)
+        undos.push(undo)
+        log(`wrapped late-registered ${isUpgrade ? 'upgrade' : 'prefix'} route ${path}`)
+      }
+      return originalSet(path, route)
+    }
+    const originalDelete = map.delete.bind(map)
+    map.delete = (path) => {
+      // 被删除的路由无需再恢复；保持 Map 语义
+      return originalDelete(path)
+    }
+    return () => {
+      map.set = originalSet
+      map.delete = originalDelete
+    }
+  }
+  undos.push(guardMaps(ws.prefixes, false))
+  undos.push(guardMaps(ws.upgrades, true))
+
+  const undo = () => { for (const u of undos.splice(0).reverse()) { try { u() } catch (e) { /* ignore */ } } }
+  return { ok: problems.length === 0, problems, undo }
+}
+
+// ---------------- DSH 外观偏好 ----------------
+
+const THEME_NAMESPACE = 'ui-theme'
+const THEME_PREFERENCE_DEFAULT = 'system'
+
+function themePreference(ctx) {
+  try {
+    const settings = ctx.get('settings')
+    if (settings === undefined) return THEME_PREFERENCE_DEFAULT
+    const section = settings.get(THEME_NAMESPACE)
+    if (section === undefined) return THEME_PREFERENCE_DEFAULT
+    const preference = section.preference
+    return (preference === 'light' || preference === 'dark') ? preference : THEME_PREFERENCE_DEFAULT
+  } catch (e) {
+    return THEME_PREFERENCE_DEFAULT
+  }
 }
 
 export async function apply(ctx) {
-  // 核心包补丁自检/自动重打（升级 DSH 后无需手动操作）
-  const patchState = ensureCorePatches(ctx)
-  if (!patchState.ok) {
-    ctx.logger.error('[dsh-webui-auth] CORE PATCH PROBLEM — /api and WebSocket are NOT protected: ' + (patchState.problems[0] || 'unknown'))
-  } else if (patchState.reapplied) {
-    ctx.logger.warn('[dsh-webui-auth] core patches were re-applied — restart DSH once for full protection')
-  }
-  ctx.logger.info('[dsh-webui-auth] started, credentials file: ' + configPath())
+  // H1: 每次启动生成随机 setup token，仅打印到宿主日志。
+  const SETUP_TOKEN = randomBytes(16).toString('hex')
 
-  // 认证开关缓存：启动读取，configure/setup/disable 更新，60 秒后台刷新
   let enabledFlag = false
   async function refreshEnabled() {
     const creds = await readCredentials(ctx)
@@ -708,12 +743,36 @@ export async function apply(ctx) {
   }
   await refreshEnabled()
 
-  // 服务端会话表 + 限流
-  const sessions = new Map()
-  let failures = []
+  // H3: 持久化会话（启动重放 + 压缩）
+  const sessions = new PersistentSessions()
+  sessions.load()
+  sessions.compact()
+
+  // H4: 按 IP 限流 { ip -> [timestamps] }
+  const failuresByIp = new Map()
+  const RATE_WINDOW_MS = 60_000
+  const RATE_MAX = 5
+
+  function ipRateLimited(ip) {
+    if (!ip) return false
+    const now = Date.now()
+    const arr = (failuresByIp.get(ip) || []).filter((t) => now - t < RATE_WINDOW_MS)
+    if (arr.length >= RATE_MAX) {
+      failuresByIp.set(ip, arr)
+      return true
+    }
+    return false
+  }
+  function recordFailure(ip) {
+    if (!ip) return
+    const now = Date.now()
+    const arr = (failuresByIp.get(ip) || []).filter((t) => now - t < RATE_WINDOW_MS)
+    arr.push(now)
+    failuresByIp.set(ip, arr)
+  }
 
   function checkRequest(req) {
-    if (!enabledFlag) return true // 未启用认证：放行一切
+    if (!enabledFlag) return true
     const token = cookieOf(req, COOKIE_NAME)
     if (!token) return false
     const s = sessions.get(token)
@@ -722,7 +781,6 @@ export async function apply(ctx) {
       sessions.delete(token)
       return false
     }
-    // 浏览器会话（ttl=0）：每次有效请求滑动续期，活跃则不过期；关闭浏览器后 cookie 消失
     if (s.browser === true) s.expiresAt = Date.now() + SESSION_BROWSER_TTL_MS
     return true
   }
@@ -740,21 +798,28 @@ export async function apply(ctx) {
   }
 
   function destroyAllSessionsExcept(keepToken) {
-    for (const k of sessions.keys()) if (k !== keepToken) sessions.delete(k)
+    for (const k of [...sessions.live.keys()]) {
+      if (k !== keepToken) sessions.delete(k)
+    }
   }
 
-  // 挂载会话闸门（dsh-client-connection 补丁读取；webServer 是共享实例，所有 ctx 可见）
-  ctx.effect(() => {
-    ctx.webServer['webuiAuthGate'] = { checkRequest }
-    return () => {
-      if (ctx.webServer['webuiAuthGate'] !== undefined) delete ctx.webServer['webuiAuthGate']
-    }
-  }, 'dsh-webui-auth: webuiAuthGate')
+  // H2: 安装运行时路由闸门
+  const gate = installRouteGate(ctx, checkRequest, (m) => ctx.logger.info('[dsh-webui-auth] ' + m))
+  ctx.effect(() => gate.undo, 'dsh-webui-auth: route gate')
+  if (!gate.ok) {
+    ctx.logger.error('[dsh-webui-auth] ROUTE GATE INCOMPLETE — ' + gate.problems.join('; ')
+      + '. /api and/or WebSocket may be unprotected; the gate will still wrap them if they register later.')
+  }
+
+  ctx.logger.info('[dsh-webui-auth] started, credentials file: ' + configPath())
+  if (!enabledFlag) {
+    ctx.logger.info('[dsh-webui-auth] setup token (first-run administrator creation): ' + SETUP_TOKEN)
+  }
 
   // 后台任务：过期会话清理 + enabled 状态刷新
   const bgTimer = setInterval(async () => {
     const now = Date.now()
-    for (const [k, s] of sessions) if (s.expiresAt <= now) sessions.delete(k)
+    for (const [k, s] of sessions.live) if (s.expiresAt <= now) sessions.delete(k)
     try {
       const creds = await readCredentials(ctx)
       enabledFlag = isEnabled(creds)
@@ -773,7 +838,6 @@ export async function apply(ctx) {
           const page = LOGIN_PAGE
             .replace('__MODE__', enabledFlag ? 'login' : 'setup')
             .replace('__THEME_PREFERENCE__', themePreference(ctx))
-          // 登录页安全响应头：页面完全自包含（内联 CSS/JS、无外部资源），可上严格 CSP
           res.writeHead(200, {
             'content-type': 'text/html; charset=utf-8',
             'cache-control': 'no-store',
@@ -801,17 +865,11 @@ export async function apply(ctx) {
             return
           }
           const meta = requestMeta(req)
-          const now = Date.now()
-          failures = failures.filter((t) => now - t < 60000)
-          if (failures.length >= 5) {
+          if (ipRateLimited(meta.ip)) {
             await auditLog(ctx, 'login_rate_limited', { username: username || null, ip: meta.ip, ua: meta.ua })
             sendJson(res, 200, { ok: false, error: 'rate-limited' })
             return
           }
-          // 凭据校验：仅接受 scrypt 哈希（v1 SHA-256 自 0.2.0 起不再支持，
-          // 旧凭据需删除 dsh-webui-auth.json 后重新创建）。
-          // 登录不做用户名格式校验，旧账号不受新规则影响。
-          // 三种情况耗时一致（恰好 1 次 scrypt）：正确 / 密码错误 / 用户名不存在。
           let valid = false
           if (username === creds.username && typeof creds.hash === 'string') {
             valid = await verifyPassword(password, creds.hash)
@@ -819,7 +877,7 @@ export async function apply(ctx) {
             valid = await dummyVerify(password)
           }
           if (!valid) {
-            failures.push(now)
+            recordFailure(meta.ip)
             await auditLog(ctx, 'login_failure', { username: username || null, ip: meta.ip, ua: meta.ua })
             sendJson(res, 200, { ok: false, error: 'invalid' })
             return
@@ -852,11 +910,18 @@ export async function apply(ctx) {
           sendJson(res, 200, { ok: false, error: 'already-configured' })
           return
         }
+        // H1: 首次配置必须携带本次启动的 setup token
         const body = await readJsonBody(req, res)
         if (body === null) return
+        const suppliedToken = typeof body.token === 'string' ? body.token.trim() : ''
+        const meta = requestMeta(req)
+        if (suppliedToken !== SETUP_TOKEN) {
+          await auditLog(ctx, 'setup_failure', { username: null, ip: meta.ip, ua: meta.ua, detail: 'setup token 缺失或不匹配' })
+          sendJson(res, 200, { ok: false, error: 'setup-token-required' })
+          return
+        }
         const username = String(body.username || '').trim()
         const password = String(body.password || '')
-        const meta = requestMeta(req)
         const nameErr = usernameError(username)
         if (nameErr) {
           await auditLog(ctx, 'setup_failure', { username: username || null, ip: meta.ip, ua: meta.ua, detail: '用户名格式不合法' })
@@ -869,9 +934,14 @@ export async function apply(ctx) {
           sendJson(res, 200, { ok: false, error: 'weak-password', reason: st.reason })
           return
         }
-        await writeCredentials(ctx, { v: 2, username, hash: await hashPassword(password), ttl: TTL_DEFAULT })
+        // H2 fail-closed：路由闸门不完整时拒绝启用认证（防止"开了登录却裸奔 /api"）
+        if (!gate.ok) {
+          await auditLog(ctx, 'setup_failure', { username, ip: meta.ip, ua: meta.ua, detail: '路由闸门不完整，拒绝启用' })
+          sendJson(res, 200, { ok: false, error: 'gate-incomplete', problem: gate.problems[0] || '' })
+          return
+        }
+        await writeCredentials(ctx, { v: 3, username, hash: await hashPassword(password), ttl: TTL_DEFAULT })
         enabledFlag = true
-        failures = []
         const s = createSession(username, TTL_DEFAULT)
         res.setHeader('Set-Cookie', sessionCookie(s.token, s.maxAge))
         await auditLog(ctx, 'setup_success', { username, ip: meta.ip, ua: meta.ua })
@@ -923,7 +993,8 @@ export async function apply(ctx) {
           enabled,
           username: enabled ? creds.username : null,
           ttl: ttlOf(creds),
-          patch: { ok: patchState.ok, reapplied: patchState.reapplied, problem: patchState.problems[0] || '' },
+          sessionsPersisted: sessions.ok,
+          gate: { ok: gate.ok, problems: gate.problems.slice(0, 3) },
         })
       } catch (e) {
         sendJson(res, 500, { error: e && e.message ? e.message : String(e) })
@@ -984,11 +1055,6 @@ export async function apply(ctx) {
           return
         }
         const wasEnabled = isEnabled(creds)
-        // creds 可能为 null（首次启用认证时还没有凭据文件）：
-        // wasEnabled 为 false，下方所有 creds.* 访问都必须以 wasEnabled 为前提。
-        // 仅当现有哈希是 scrypt 格式时才允许"密码留空=不修改"：
-        // 旧版 v1 哈希（非 scrypt）不能被原样保留（登录校验只认 scrypt），
-        // 此时必须提供新密码，否则账号会因哈希格式不符而无法登录。
         const hashIsScrypt = creds !== null && typeof creds.hash === 'string' && creds.hash.startsWith(SCRYPT_PREFIX)
         const keepPassword = wasEnabled && !password && hashIsScrypt
         if (wasEnabled && !password && !hashIsScrypt) {
@@ -1012,6 +1078,12 @@ export async function apply(ctx) {
             return
           }
         }
+        // H2 fail-closed：闸门不完整时拒绝启用
+        if (!wasEnabled && !gate.ok) {
+          await auditLog(ctx, 'configure_failure', { username, ip: meta.ip, ua: meta.ua, detail: '路由闸门不完整，拒绝启用' })
+          sendJson(res, 200, { ok: false, error: 'gate-incomplete', problem: gate.problems[0] || '' })
+          return
+        }
         let ttl = wasEnabled ? ttlOf(creds) : TTL_DEFAULT
         if (body.ttl !== undefined) {
           ttl = Number(body.ttl)
@@ -1021,17 +1093,14 @@ export async function apply(ctx) {
           }
         }
         const credsOut = (keepPassword && typeof creds.hash === 'string')
-          ? { v: 2, username, hash: creds.hash, ttl }
-          : { v: 2, username, hash: await hashPassword(password), ttl }
+          ? { v: 3, username, hash: creds.hash, ttl }
+          : { v: 3, username, hash: await hashPassword(password), ttl }
         await writeCredentials(ctx, credsOut)
         enabledFlag = true
-        failures = []
         if (wasEnabled) {
-          // 修改凭据：吊销除当前会话外的所有会话
           const keepToken = cookieOf(req, COOKIE_NAME)
           destroyAllSessionsExcept(keepToken)
         } else {
-          // 首次启用：直接建立会话
           const s = createSession(username, ttl)
           res.setHeader('Set-Cookie', sessionCookie(s.token, s.maxAge))
         }
@@ -1078,7 +1147,6 @@ export async function apply(ctx) {
         sessions.clear()
         res.setHeader('Set-Cookie', clearSessionCookie())
         enabledFlag = false
-        failures = []
         await auditLog(ctx, 'disable_success', { username: creds.username, ip: meta.ip, ua: meta.ua })
         sendJson(res, 200, { ok: true })
       } catch (e) {
@@ -1121,14 +1189,6 @@ export async function apply(ctx) {
 }
 
 // ---------------- CLI：node index.js audit [--limit N] ----------------
-//
-// 直接运行本文件时进入 CLI 模式（作为 Cordis 插件被 DSH 加载时不会触发，
-// 此时 process.argv[1] 是 DSH 入口而非本文件）。审计日志为 JSONL 追加写，
-// 位于插件目录 audit.jsonl（与凭据文件同目录）。
-//
-// 用法：
-//   node index.js audit             查看最近 20 条审计日志
-//   node index.js audit --limit 50  指定条数（1-200）
 
 let metaFilePath = null
 try {
@@ -1144,8 +1204,6 @@ const isCliEntry = metaFilePath !== null && (() => {
   try {
     const entry = process.argv[1]
     if (!entry) return false
-    // Windows 文件系统大小写不敏感：统一小写后再比较，避免
-    // import.meta.url 与 argv[1] 的大小写差异导致 CLI 不触发
     const self = process.platform === 'win32' ? metaFilePath.toLowerCase() : metaFilePath
     const resolved = resolvePath(entry)
     return (process.platform === 'win32' ? resolved.toLowerCase() : resolved) === self
@@ -1181,7 +1239,6 @@ if (isCliEntry) {
       const parts = [r.ts || '?', r.event || '?']
       if (r.username) parts.push('user=' + r.username)
       if (r.ip) parts.push('ip=' + r.ip)
-      if (r.ua) parts.push('ua=' + (typeof r.ua === 'string' && r.ua.length > 60 ? r.ua.slice(0, 60) + '…' : String(r.ua)))
       if (r.detail) parts.push('detail=' + String(r.detail))
       console.log('  ' + parts.join('  '))
     }
