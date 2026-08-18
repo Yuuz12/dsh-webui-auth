@@ -105,6 +105,9 @@ async function dummyVerify(password) {
   return verifyPassword(password, h)
 }
 
+// 供测试与工具脚本使用（Cordis 加载时只消费 name/inject/apply，多余导出无副作用）
+export { hashPassword, verifyPassword, auditLog, readAuditEntries, resolveDataDirFrom, DATA_DIR }
+
 // ---------------- 数据目录与文件 ----------------
 
 function pluginDir() {
@@ -216,19 +219,27 @@ async function auditFilePath(ctx) {
  * 或 /64（IPv6）网络前缀明文，便于聚合分析同时不落原始地址。
  * 密钥文件首次生成，0600，与凭据同目录。
  */
+let auditHmacKeyCache = null
 function auditHmacKey() {
+  if (auditHmacKeyCache !== null) return auditHmacKeyCache
   const kp = hmacKeyPath()
   try {
     const existing = readFileSync(kp, 'utf8').trim()
-    if (existing.length >= 32) return existing
+    if (existing.length >= 32) {
+      auditHmacKeyCache = existing
+      return existing
+    }
   } catch (e) { /* not present yet */ }
   ensureDataDir()
   const key = randomBytes(32).toString('hex')
   try {
     writeFileSync(kp, key + '\n', { mode: 0o600 })
+    auditHmacKeyCache = key
     return key
   } catch (e) {
-    return 'fallback-key-unavailable-' + key.slice(0, 8)
+    // 落盘失败：仍缓存本次生成的 key，保证同一进程内同一 IP 的假名一致（可聚合）
+    auditHmacKeyCache = 'fallback-key-unavailable-' + key.slice(0, 8)
+    return auditHmacKeyCache
   }
 }
 
@@ -240,14 +251,17 @@ function anonymizeIp(ip) {
   } catch (e) {
     pseudo = 'err'
   }
-  // 网络 /24 或 /64 前缀（聚合分析用）
+  // 网络 /24 或 /64 前缀（聚合分析用）；IPv4-mapped IPv6（::ffff:a.b.c.d）先还原为 IPv4，
+  // 否则会产出 "::ffff:1.2.3.0/24" 这类畸形前缀。
+  let v = ip
+  const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/.exec(ip)
+  if (mapped) v = mapped[1]
   let net = null
-  if (ip.includes('.')) {
-    const parts = ip.split('.').slice(0, 3).join('.')
+  if (v.includes('.')) {
+    const parts = v.split('.').slice(0, 3).join('.')
     net = parts + '.0/24'
   } else {
-    const clean = ip.replace(/^::ffff:/, '')
-    const groups = clean.split(':').slice(0, 4).join(':')
+    const groups = v.split(':').slice(0, 4).join(':')
     net = groups + '::/64'
   }
   return `hmac:${pseudo}|${net}`
@@ -377,6 +391,17 @@ function cookieOf(req, name) {
   return null
 }
 
+/**
+ * 恒定时间令牌比较：先对两侧做 HMAC-SHA256 归一化（消除长度侧信道），
+ * 再 timingSafeEqual。用于 setup token 校验（128-bit 随机值，网络时序本难利用，
+ * 但恒定时间是正确的习惯）。
+ */
+function safeTokenEquals(supplied, expected) {
+  const a = createHmac('sha256', 'dsh-webui-auth-token-cmp').update(String(supplied)).digest()
+  const b = createHmac('sha256', 'dsh-webui-auth-token-cmp').update(String(expected)).digest()
+  return timingSafeEqual(a, b)
+}
+
 // ---------------- 会话管理（H3：持久化到磁盘） ----------------
 
 const COOKIE_NAME = 'dsh_wua_session'
@@ -417,6 +442,8 @@ class PersistentSessions {
         if (s.expiresAt > Date.now()) this.live.set(ev.token, s)
       } else if (ev.op === 'remove') {
         this.live.delete(ev.token)
+      } else if (ev.op === 'remove-many' && Array.isArray(ev.tokens)) {
+        for (const t of ev.tokens) this.live.delete(t)
       } else if (ev.op === 'clear') {
         this.live.clear()
       }
@@ -426,7 +453,8 @@ class PersistentSessions {
   append(ev) {
     try {
       ensureDataDir()
-      appendFileSync(sessionsPath(), JSON.stringify(ev) + '\n', 'utf8')
+      // 会话 token 是裸的 bearer 凭据：文件权限收紧到 0600（与 setup-token / audit-hmac-key 一致）
+      appendFileSync(sessionsPath(), JSON.stringify(ev) + '\n', { encoding: 'utf8', mode: 0o600 })
       this.ok = true
     } catch (e) {
       this.ok = false // 磁盘写失败：认证继续，仅丢失重启恢复能力
@@ -442,7 +470,7 @@ class PersistentSessions {
       for (const [token, s] of this.live) {
         if (s.expiresAt > now) out.push({ op: 'add', token, sess: s })
       }
-      writeFileSync(sessionsPath(), out.map((e) => JSON.stringify(e)).join('\n') + (out.length ? '\n' : ''), 'utf8')
+      writeFileSync(sessionsPath(), out.map((e) => JSON.stringify(e)).join('\n') + (out.length ? '\n' : ''), { encoding: 'utf8', mode: 0o600 })
     } catch (e) { /* 压缩失败不影响运行 */ }
   }
 
@@ -455,6 +483,17 @@ class PersistentSessions {
   set(token, sess) {
     this.live.set(token, sess)
     this.append({ op: 'add', token, sess })
+  }
+  // 批量移除（除 keepToken 外全部）：只追加一条 remove-many 事件，避免逐个 append 的写放大
+  deleteAllExcept(keepToken) {
+    const removed = []
+    for (const k of [...this.live.keys()]) {
+      if (k !== keepToken) {
+        this.live.delete(k)
+        removed.push(k)
+      }
+    }
+    if (removed.length > 0) this.append({ op: 'remove-many', tokens: removed })
   }
   clear() {
     this.live.clear()
@@ -482,6 +521,8 @@ const LOGIN_PAGE = `<!DOCTYPE html>
     --dsw-alias-label-secondary: rgb(97, 102, 107);
     --dsw-alias-brand-primary: rgb(15, 17, 21);
     --dsw-alias-state-error-primary: rgb(236, 19, 19);
+    --dsw-alias-state-success-primary: rgb(34, 197, 94);
+    --dsw-alias-state-warn-primary: rgb(245, 158, 11);
   }
   body[data-ds-dark-theme] {
     --dsw-alias-bg-base: rgb(21, 21, 23);
@@ -493,6 +534,8 @@ const LOGIN_PAGE = `<!DOCTYPE html>
     --dsw-alias-label-secondary: rgb(207, 211, 214);
     --dsw-alias-brand-primary: rgb(249, 250, 251);
     --dsw-alias-state-error-primary: rgb(242, 90, 90);
+    --dsw-alias-state-success-primary: rgb(34, 197, 94);
+    --dsw-alias-state-warn-primary: rgb(245, 158, 11);
   }
   body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
     background: var(--dsw-alias-bg-base, #f7f7f8); font-family: system-ui, -apple-system, 'Segoe UI', sans-serif; }
@@ -728,15 +771,27 @@ function installRouteGate(ctx, checkRequest, log) {
   // 周期重扫：捕获晚注册（loader 波次/服务重挂载）。全找到后停止（但保留
   // 低频兜底扫描，防止服务重建后路由对象被替换）。
   let elapsed = 0
+  let scans = 0
+  let transitioned = false
   const rescan = setInterval(() => {
     if (undone) { clearInterval(rescan); return }
     scanOnce()
     elapsed += 2
-    if (problems.size === 0 && elapsed > 60) {
-      // 全部就位后降频为 10s 兜底（服务 fiber 重建时路由对象会换新）
+    scans += 1
+    if (!transitioned && problems.size === 0 && elapsed > 60) {
+      // 全部就位后降频为 10s 兜底（服务 fiber 重建时路由对象会换新）；
+      // 仅迁移一次，避免每个 tick 重复创建慢速 interval 造成泄漏。
+      transitioned = true
       clearInterval(rescan)
       const slow = setInterval(() => { if (!undone) scanOnce(); else clearInterval(slow) }, 10000)
       undos.push(() => clearInterval(slow))
+      return
+    }
+    if (problems.size > 0 && scans >= 150) {
+      // 5 分钟（@2s）内路由始终未注册：停止重扫，保持 fail-closed（setup/configure
+      // 不会启用认证）并记录明确错误，避免无限空转。
+      clearInterval(rescan)
+      log('route gate: stopped rescanning after ' + scans + ' attempts — routes never registered: ' + [...problems].join('; '))
     }
   }, 2000)
   undos.push(() => clearInterval(rescan))
@@ -832,9 +887,7 @@ export async function apply(ctx) {
   }
 
   function destroyAllSessionsExcept(keepToken) {
-    for (const k of [...sessions.live.keys()]) {
-      if (k !== keepToken) sessions.delete(k)
-    }
+    sessions.deleteAllExcept(keepToken)
   }
 
   // H2: 安装运行时路由闸门
@@ -955,7 +1008,7 @@ export async function apply(ctx) {
         if (body === null) return
         const suppliedToken = typeof body.token === 'string' ? body.token.trim() : ''
         const meta = requestMeta(req)
-        if (suppliedToken !== SETUP_TOKEN) {
+        if (!safeTokenEquals(suppliedToken, SETUP_TOKEN)) {
           await auditLog(ctx, 'setup_failure', { username: null, ip: meta.ip, ua: meta.ua, detail: 'setup token 缺失或不匹配' })
           sendJson(res, 200, { ok: false, error: 'setup-token-required' })
           return
