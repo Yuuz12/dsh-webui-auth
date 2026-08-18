@@ -6,16 +6,21 @@ A persistent WebUI authentication plugin for DeepSeek Harness. Once you create a
 
 ## Architecture
 
-Authentication is enforced in four layers:
+Authentication is enforced in four layers, all implemented by **wrapping the webServer routes at runtime — no DSH core package source is modified**:
 
 | Layer | Mechanism | Unauthenticated behavior |
 |---|---|---|
 | WebUI resources (index.html, /assets/*, SPA routes) | Plugin registers a `prefix ''` catch-all route; after session validation it hands off to frontend-static | 302 → login page |
-| Plugin bundles (/plugins/*) | `dsh-client-modules` patch: checks `webServer.webuiAuthGate` before serving | 302 → login page |
-| /api RPC surface | `dsh-client-connection` patch: same gate before routing | 401 |
-| WebSocket (/api/events.mux, /api/events.host) | Same package patch: same gate before upgrade handshake | 403 upgrade rejected |
+| Plugin bundles (/plugins/*) | Wraps the `/plugins` prefix route handler at runtime | 401 |
+| /api RPC surface | Wraps the `/api` prefix route handler at runtime | 401 |
+| WebSocket (/api/events.mux, /api/events.host) | Wraps the upgrade route handlers at runtime | 401 upgrade rejected |
 
-Sessions are **server-side, in-memory**, carried by an `HttpOnly; SameSite=Lax` cookie (`dsh_wua_session`) that JS cannot read; changing the password **revokes every other session**.
+- **No core patching**: a DSH upgrade never overwrites patches and never leaves `/api` exposed after an upgrade. Every startup re-wraps the route tables, with a 2s→10s rescan loop that catches late-registered routes.
+- **Fail-closed**: if the expected routes are missing (DSH internals changed so wrapping can't apply), `setup`/`configure` **refuse to enable authentication** and the problem is reported both in the host log and on the settings page — better unusable than "login enabled with an unprotected /api".
+- **Privileged methods behind a reverse proxy / LAN**: after the session check the plugin hands authenticated requests to the core in a "loopback shape", so the core's **loopback-pinned privileged methods** (settings/credentials/agentPreset/llm.discoverModels) work in proxied deployments — the session-cookie gate is a strictly stronger identity proof than the Host-header heuristic it replaces.
+- **WebSocket and `trustedHosts`**: the WS upgrade handshake still goes through the core's own `isTrustedApiRequest`, so **in reverse-proxy / LAN deployments (non-loopback Host) you must also add the public hostname to `client-connection.trustedHosts` in the DSH config**, otherwise even authenticated upgrades are rejected.
+
+Sessions are **server-side and persisted to disk** (`sessions.jsonl`, survive a DSH restart, expire server-side), carried by an `HttpOnly; SameSite=Lax` cookie (`dsh_wua_session`) that JS cannot read; changing the password **revokes every other session**.
 
 ## Installation
 
@@ -51,25 +56,19 @@ Fetches the repository source (works directly — no build step either). Prefer 
 
 ### Common to all methods
 
-3. **Apply the core-package patches** (no manual re-patching needed after a DSH upgrade): in
-   `node_modules/@deepseek-ai/dsh-client-connection/lib/index.js` and
-   `node_modules/@deepseek-ai/dsh-client-modules/lib/index.js`,
-   search for `[dsh-webui-auth patch]` comments and confirm the three session-gate blocks exist (already applied in this repository). On every startup the plugin re-checks these markers: if a marker is missing and its anchor matches, the patch is re-inserted automatically (restart after a DSH upgrade is enough to recover); if the core packages were restructured so auto-patching fails, the error is reported loudly both in the host log **and on the WebUI settings page** — never silently.
-4. Restart DSH
+**No core-package patches are needed** (no `[dsh-webui-auth patch]` markers, no `node_modules` edits) — just restart DSH. On startup the host log prints `[dsh-webui-auth] started, credentials file: ...`; if the route wrapping is incomplete it prints `ROUTE GATE INCOMPLETE` and authentication cannot be enabled (fail-closed).
 
 ## Uninstallation
 
 ### Method 1: `dsh plugin` command (for method-1 installs)
 
 1. `npx @deepseek-ai/dsh plugin --profile web remove dsh-webui-auth` (removes both the dependency and the bundle layer)
-2. **(Optional) Restore the core packages**: delete the code blocks starting with `// [dsh-webui-auth patch]` in `dsh-client-connection/lib/index.js` (2 places) and `dsh-client-modules/lib/index.js` (1 place). **Leaving them is harmless** — once the plugin is gone the gate never triggers (the patched code is a no-op without the plugin), and a DSH upgrade overwrites them anyway.
-3. Restart DSH
+2. Restart DSH
 
 ### Method 2: manual (for method-2 installs)
 
-1. **(Optional) Restore the core packages** (same as above)
-2. **Delete the plugin directory** `profiles/web/node_modules/dsh-webui-auth/` (the credentials file `dsh-webui-auth.json` goes with it)
-3. **Remove the mount row** from `profiles/web/cordis.patch.yml`:
+1. **Delete the plugin directory** `profiles/web/node_modules/dsh-webui-auth/` (the credentials file `dsh-webui-auth.json` goes with it)
+2. **Remove the mount row** from `profiles/web/cordis.patch.yml`:
 
 ```yaml
     - id: dsh-webui-auth
@@ -77,30 +76,37 @@ Fetches the repository source (works directly — no build step either). Prefer 
 ```
 
    This step is required — otherwise the loader fails at startup because the package is missing.
-4. **Restart DSH**
+3. **Restart DSH**
 
-With either method, after the restart authentication is fully disabled. No browser cleanup is needed (sessions live in process memory and disappear with it; cookies become invalid). If you previously used the older pre-hardening build, the leftover `dsh-webui-auth.session` key in browser localStorage is harmless and may be removed optionally.
+With either method, after the restart authentication is fully disabled (**no core sources to restore** — the plugin never modified core files). To also clear persisted sessions, delete `sessions.jsonl` in the data directory. If you previously used the older pre-hardening build, the leftover `dsh-webui-auth.session` key in browser localStorage is harmless and may be removed optionally.
 
 ## Usage
 
-- **First enable**: while no credentials exist, authentication is off (all requests pass). Open WebUI → Settings → 身份认证 (Authentication), create an account/password (≥8 characters, must include uppercase, lowercase, digit and special character) and save; or visit `/dsh-webui-auth/login` directly — the page shows a "Create administrator account" form. Authentication takes effect immediately and the current browser receives a session automatically.
+- **First enable (setup token required)**: while no credentials exist, authentication is off (all requests pass), but creating the administrator account requires a **per-boot setup token** — open WebUI → Settings → 身份认证 (Authentication), or visit `/dsh-webui-auth/login`, enter the token printed in the startup log as `[dsh-webui-auth] setup token (...)` (or read the `setup-token` file in the data directory, mode 0600), then create an account/password (≥8 characters, must include uppercase, lowercase, digit and special character). The token is regenerated on every boot and deleted once setup succeeds, preventing someone from claiming the administrator account in the "exposed before configured" window.
 - **Username rule**: 3-32 characters of letters, digits, underscore or hyphen (enforced on create/change; legacy accounts are unaffected and can still log in).
-- **Afterwards**: any unauthenticated visit to any path redirects to the login page; after login you stay signed in for the chosen **session lifetime** (browser session / 1 hour / 12 hours (default) / 1 day / 3 days), enforced server-side by expiry. "Browser session" mode: the 30-minute window slides with activity, and closing the browser logs you out.
+- **Afterwards**: any unauthenticated visit to any path redirects to the login page; after login you stay signed in for the chosen **session lifetime** (browser session / 1 hour / 12 hours (default) / 1 day / 3 days), enforced server-side by expiry. **Sessions are persisted to disk — after a DSH restart logged-in devices stay signed in** (the expiry still applies). "Browser session" mode: the 30-minute window slides with activity, and closing the browser logs you out.
 - **Change / disable / log out**: Settings → 身份认证 (all require the current password); changing the password revokes every other logged-in session.
-- **Forgot password**: delete `dsh-webui-auth.json` in the data directory — a background check every minute disables authentication within at most 1 minute (no restart needed), then create a new account.
+- **Forgot password**: delete `dsh-webui-auth.json` in the data directory — a background check every minute disables authentication within at most 1 minute (no restart needed), then create a new account with a fresh setup token.
 
 ## Where data files live (depends on install mode)
 
-Credentials (`dsh-webui-auth.json`) and the audit log (`audit.jsonl`) are stored in the **runtime data directory**:
+Credentials and security data are stored in the **runtime data directory**: for local link / source installs (`dsh plugin add ./dsh-webui-auth`) that is the plugin source directory (removed with the plugin, managed with the repo); for npm / GitHub / tarball installs (the pnpm store is read-only, so the module directory cannot be written) it automatically falls back to `$DSH_HOME/dsh-webui-auth/` (default `~/.dsh/dsh-webui-auth/`).
 
-- **Local link / source install** (`dsh plugin add ./dsh-webui-auth`): the plugin source directory — removed with the plugin, managed with the repo;
-- **npm / GitHub / tarball install** (the pnpm store is read-only, so the module directory cannot be written): automatically falls back to `$DSH_HOME/dsh-webui-auth/` (default `~/.dsh/dsh-webui-auth/`).
+Files in the data directory:
 
-The plugin probes writability at startup and picks one location; the "forgot password" and audit paths above refer to that data directory.
+| File | Purpose | Permissions |
+|---|---|---|
+| `dsh-webui-auth.json` | Credentials (scrypt hash, v3 format; 0.2.x v2 credentials still verify and log in) | — |
+| `audit.jsonl` | Audit log (IPs pseudonymized, see "Audit log") | — |
+| `sessions.jsonl` | Persisted sessions (restart recovery) | 0600 |
+| `audit-hmac-key` | HMAC key for audit-IP pseudonymization (auto-generated once) | 0600 |
+| `setup-token` | First-run setup token (deleted after setup succeeds) | 0600 |
+
+The plugin probes writability at startup and picks one location; the "forgot password", audit and session paths above refer to that data directory.
 
 ## Audit log
 
-Security events — login success/failure/rate-limit, setup, configure, disable, logout — are **appended as JSONL to `audit.jsonl`** in the data directory (timestamp, username, IP, user-agent, detail; see "Where data files live"). Two ways to view:
+Security events — login success/failure/rate-limit, setup, configure, disable, logout — are **appended as JSONL to `audit.jsonl`** in the data directory (timestamp, username, IP, user-agent, detail). **Client IPs are pseudonymized with HMAC-SHA256** (e.g. `hmac:5151e752|203.0.113.0/24`, with the /24 (IPv4) or /64 (IPv6) network prefix kept in cleartext for aggregation); raw addresses are never written to disk. Two ways to view:
 
 - **CLI** (recommended): run `node index.js audit [--limit N]` (last 20 entries by default; run from the module path):
   ```sh
@@ -116,22 +122,24 @@ Both the login page and the "Settings → 身份认证 (Authentication)" setting
 
 ## What to do after upgrading DSH
 
-1. Upgrade and restart DSH → the plugin detects the missing core patches and re-inserts them automatically (host log records `re-applied core patch`)
-2. At this point the **settings page shows a yellow warning** "已自动恢复，请重启 DSH 使认证完全生效" — the patches were written to disk, but the running process's core modules were already loaded without them (`/api` and WebSocket are temporarily unprotected)
-3. **Restart DSH once more** → the patches load with the core modules, the warning disappears, and all four layers are fully enforced
-4. If auto-repatching fails (core packages restructured), the settings page shows a **red warning** with the specific reason, and the host log prints `PATCH ANCHOR NOT FOUND` etc.
+**Nothing.** The plugin never modifies core packages — after a DSH upgrade the runtime route wrapping is re-applied automatically on startup. If the wrapping is incomplete (DSH internals changed), the host log prints `ROUTE GATE INCOMPLETE`, the settings page shows a red warning, and `setup`/`configure` refuse to enable authentication (fail-closed).
 
 ## Data & Security
 
-- Passwords are hashed with **scrypt** (Node's built-in memory-hard KDF — GPU/ASIC resistant, zero dependencies) and stored in `dsh-webui-auth.json` in the data directory (location depends on install mode, see above); plaintext is never written to disk. **Since 0.2.0 only scrypt hashes are accepted**: 0.1.x SHA-256 credentials can no longer be verified — delete the credentials file and recreate the account (see "Forgot password").
-- Login rate limiting: at most 5 failures per minute. Failed verifications also run a dummy scrypt pass so "unknown account" and "wrong password" take the same time, defeating username enumeration via response timing.
-- Audit log: security events are appended to `audit.jsonl` (see "Audit log" above).
+- Passwords are hashed with **scrypt** (Node's built-in memory-hard KDF — GPU/ASIC resistant, zero dependencies) and stored in `dsh-webui-auth.json` in the data directory (location depends on install mode, see above); plaintext is never written to disk. Credentials format is v3 (same scrypt encoding as v2 — only the version marker and field semantics changed); **0.2.x v2 credentials still verify**. **Since 0.2.0 only scrypt hashes are accepted**: 0.1.x SHA-256 credentials can no longer be verified — delete the credentials file and recreate the account (see "Forgot password").
+- Login rate limiting: **per client IP**, at most 5 failures per minute — a single attacker can no longer lock out other users (or the operator). Behind a reverse proxy the client IP is taken from `CF-Connecting-IP` / the leftmost `X-Forwarded-For`, and the proxy headers are trusted **only when the socket peer is loopback** (local caddy/cloudflared) — remote callers cannot spoof them. Failed verifications also run a dummy scrypt pass so "unknown account" and "wrong password" take the same time, defeating username enumeration via response timing.
+- First-run setup requires a **per-boot setup token** (128-bit, printed to the host log and written to `setup-token` in the data directory, mode 0600), preventing account claiming in the "exposed before configured" window.
+- Audit log: `audit.jsonl`, client IPs pseudonymized with HMAC (see "Audit log").
+- Persisted sessions: `sessions.jsonl` (0600), restored on restart; a write failure never affects authentication — the settings page just warns that a restart will require re-login.
 - Security headers on the login page and API responses: strict CSP, `nosniff`, `DENY` framing, `no-referrer`, `noindex`, `no-store`.
 - Cookie `HttpOnly + SameSite=Lax`: not readable by JS, not sent on cross-site requests.
-- The login/setup endpoints are intentionally public (the entry point of authentication); pre-registered exact endpoints such as `/dsh-vision-helper/config` are not gated (configuration data only, not WebUI access).
+- The login/setup endpoints are intentionally public (the entry point of authentication): `/dsh-webui-auth/login` and `/dsh-webui-auth/setup` (the latter protected by the setup token).
 
 ## Known limits
 
-- **Core-patch self-maintenance**: the plugin checks `[dsh-webui-auth patch]` markers at startup and re-patches automatically (when anchors match); a restart after a DSH upgrade restores protection. An auto-repatch does **not** affect the running process (core modules are already loaded) — one more restart is required. Failures surface both in the host log and on the WebUI settings page (yellow/red banner), never silently.
-- Sessions live in process memory: restarting DSH invalidates all sessions (login again); the credentials file persists.
+- **Inherent runtime-wrapping window**: between a route-object replacement (service hot-reload) and the next rescan (≤10s) there is an unprotected window; the fail-closed check on enabling covers the "initially exposed" case, so this window only affects hot-reload during runtime.
+- **WebSocket and `trustedHosts`**: in reverse-proxy / LAN deployments (non-loopback Host), WS downlinks need the public hostname added to `client-connection.trustedHosts` in the DSH config (see "Architecture").
+- **Proxy on a different host**: if the reverse proxy is not on the same machine as DSH (non-loopback peer), the proxy headers are not trusted and rate limiting aggregates per proxy IP (degrades to a global bucket).
+- **Limits of audit pseudonymization**: the HMAC key lives in the same data directory (0600); a local attacker who can read it can brute-force the IP space — pseudonymization protects against "plaintext IPs at rest", not against an attacker with file access.
+- Sessions live in `sessions.jsonl`: they survive restarts (expiry unchanged); uninstalling/disabling the plugin does not affect credentials.
 - Threat model is "browser/network clients": local processes that can read/write the host's memory or files are out of scope.
