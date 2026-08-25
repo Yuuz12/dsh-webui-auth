@@ -128,19 +128,43 @@ function pluginDir() {
   return null
 }
 
+function legacyHomeDir() {
+  const home = process.env.DSH_HOME
+    || ((process.env.USERPROFILE || process.env.HOME || '.') + '/.dsh')
+  return home.replace(/\\/g, '/').replace(/\/+$/, '') + '/dsh-webui-auth'
+}
+
 function resolveDataDirFrom(dir) {
+  // npm/GitHub/tarball 安装：包体位于某个 node_modules 之内，会随插件升级、重装、
+  // 清理 node_modules 被整目录替换——凭据等运行数据必须放在该 node_modules 的上级
+  // 目录下的 .dsh-webui-auth/ 才能存活。取【第一段】node_modules：pnpm 的真实路径形如
+  // .../node_modules/.pnpm/<pkg>@<ver>/node_modules/<pkg>，只有最外层 node_modules
+  // 的上级（通常是 profile 根）才是稳定位置。link/源码安装时 Node 已把 import.meta.url
+  // 解析为真实路径，不含 node_modules 段，走原有逻辑（数据在源码目录，随仓库管理）。
+  if (dir) {
+    const norm = dir.replace(/\\/g, '/')
+    const cut = norm.indexOf('/node_modules/')
+    if (cut !== -1) {
+      const root = norm.slice(0, cut) || '/'
+      const dataDir = root + '/.dsh-webui-auth'
+      try {
+        mkdirSync(dataDir, { recursive: true })
+        accessSync(dataDir, fsConstants.W_OK)
+        return dataDir
+      } catch (e) { /* 上级目录不可写：继续走回退链 */ }
+    }
+  }
   if (dir) {
     try {
       accessSync(dir, fsConstants.W_OK)
       return dir
     } catch (e) { /* store/只读目录：回退 */ }
   }
-  const home = process.env.DSH_HOME
-    || ((process.env.USERPROFILE || process.env.HOME || '.') + '/.dsh')
-  return home.replace(/\\/g, '/').replace(/\/+$/, '') + '/dsh-webui-auth'
+  return legacyHomeDir()
 }
 
-const DATA_DIR = resolveDataDirFrom(pluginDir())
+const MODULE_DIR = pluginDir()
+const DATA_DIR = resolveDataDirFrom(MODULE_DIR)
 
 function configPath() {
   return DATA_DIR + '/dsh-webui-auth.json'

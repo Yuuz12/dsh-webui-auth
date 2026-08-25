@@ -67,7 +67,7 @@ Fetches the repository source (works directly — no build step either). Prefer 
 
 ### Method 2: manual (for method-2 installs)
 
-1. **Delete the plugin directory** `profiles/web/node_modules/dsh-webui-auth/` (the credentials file `dsh-webui-auth.json` goes with it)
+1. **Delete the plugin directory** `profiles/web/node_modules/dsh-webui-auth/` (since 0.3.1 runtime data lives outside the package, deleting it does not touch the account; to wipe the account too, also delete the `.dsh-webui-auth/` data directory — see "Data file locations")
 2. **Remove the mount row** from `profiles/web/cordis.patch.yml`:
 
 ```yaml
@@ -90,7 +90,13 @@ With either method, after the restart authentication is fully disabled (**no cor
 
 ## Where data files live (depends on install mode)
 
-Credentials and security data are stored in the **runtime data directory**: for local link / source installs (`dsh plugin add ./dsh-webui-auth`) that is the plugin source directory (removed with the plugin, managed with the repo); for npm / GitHub / tarball installs (the pnpm store is read-only, so the module directory cannot be written) it automatically falls back to `$DSH_HOME/dsh-webui-auth/` (default `~/.dsh/dsh-webui-auth/`).
+Credentials and security data are stored in the **runtime data directory**, chosen automatically by install mode:
+
+- **npm / GitHub / tarball installs**: the package lives inside `node_modules`, which is wholesale replaced on upgrade, reinstall or cleanup — so data is stored in a `.dsh-webui-auth/` directory **next to that `node_modules`** (usually the profile root, e.g. `~/.dsh/profiles/web/.dsh-webui-auth/`). Upgrading the plugin, `pnpm clean`, or reinstalling DSH no longer loses the account or login sessions.
+- **Local link / source installs** (`dsh plugin add ./dsh-webui-auth`): the plugin source directory itself (managed with the repo and excluded from git via `.gitignore`; deleting the whole source checkout is what deletes the data).
+- **Fallback**: when none of the above is writable, `$DSH_HOME/dsh-webui-auth/` (default `~/.dsh/dsh-webui-auth/`) is used.
+
+Upgrading from 0.3.x: runtime data is **not migrated automatically**. If the legacy data (inside the package directory or `~/.dsh/dsh-webui-auth/`) still exists, copy `dsh-webui-auth.json`, `sessions.jsonl`, `audit-hmac-key` and `audit.jsonl` from the table below into the new data directory manually (for npm / GitHub / tarball installs that is `.dsh-webui-auth/` next to `node_modules`); otherwise just recreate the account with a fresh setup token (see "Forgot password").
 
 Files in the data directory:
 
@@ -102,7 +108,7 @@ Files in the data directory:
 | `audit-hmac-key` | HMAC key for audit-IP pseudonymization (auto-generated once) | 0600 |
 | `setup-token` | First-run setup token (deleted after setup succeeds) | 0600 |
 
-The plugin probes writability at startup and picks one location; the "forgot password", audit and session paths above refer to that data directory.
+The data directory is chosen by install mode (npm / GitHub / tarball → `.dsh-webui-auth/` next to `node_modules`; link / source → the plugin source directory; fallback `$DSH_HOME/dsh-webui-auth/`); the "forgot password", audit and session paths above refer to that data directory.
 
 ## Audit log
 

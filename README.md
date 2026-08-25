@@ -67,7 +67,7 @@ npx @deepseek-ai/dsh plugin --profile web add github:Yuuz12/dsh-webui-auth
 
 ### 方式二：手动（对应方式二安装）
 
-1. 删除插件目录 `profiles/web/node_modules/dsh-webui-auth/`
+1. 删除插件目录 `profiles/web/node_modules/dsh-webui-auth/`（0.3.1 起运行数据在包外，删它不影响账号；如需连账号一起清除，另删数据目录 `.dsh-webui-auth/`，见「数据文件位置」）
 2. 从 `profiles/web/cordis.patch.yml` 移除挂载行：
 
 ```yaml
@@ -90,7 +90,13 @@ npx @deepseek-ai/dsh plugin --profile web add github:Yuuz12/dsh-webui-auth
 
 ## 数据文件位置（按安装方式区分）
 
-凭据与安全数据存放在**运行时数据目录**：本地 link / 源码安装时为插件源码目录（卸载即清、随仓库管理）；npm / GitHub / tarball 安装时（pnpm store 只读）自动回退到 `$DSH_HOME/dsh-webui-auth/`（默认 `~/.dsh/dsh-webui-auth/`）。
+凭据与安全数据存放在**运行时数据目录**，按安装方式自动选择：
+
+- **npm / GitHub / tarball 安装**：插件包体位于 `node_modules` 内，会随升级、重装、清理被整目录替换——数据因此存放在**该 `node_modules` 的上级目录**下的 `.dsh-webui-auth/`（通常即 profile 根，如 `~/.dsh/profiles/web/.dsh-webui-auth/`）。升级插件、`pnpm clean`、重装 DSH 都不会丢失账号密码与登录会话。
+- **本地 link / 源码安装**：为插件源码目录（随仓库管理、已被 `.gitignore` 排除出 git；删除整个源码目录才会连数据一起清除）。
+- **兜底**：以上位置均不可写时回退到 `$DSH_HOME/dsh-webui-auth/`（默认 `~/.dsh/dsh-webui-auth/`）。
+
+从 0.3.x 升级：运行数据**不自动迁移**。若旧位置（包内目录或 `~/.dsh/dsh-webui-auth/`）的数据还在，可把下表中的 `dsh-webui-auth.json`、`sessions.jsonl`、`audit-hmac-key`、`audit.jsonl` 手动拷入新数据目录（npm / GitHub / tarball 安装即 `node_modules` 上级的 `.dsh-webui-auth/`）；否则按「忘记密码」流程用新 setup token 重建账号即可。
 
 目录内文件：
 
@@ -102,7 +108,7 @@ npx @deepseek-ai/dsh plugin --profile web add github:Yuuz12/dsh-webui-auth
 | `audit-hmac-key` | 审计 IP 假名化的 HMAC 密钥（首次自动生成） | 0600 |
 | `setup-token` | 首次初始化的 setup token（创建成功后删除） | 0600 |
 
-插件启动时探测目录可写性并固定其一，两种安装方式的忘记密码/审计/会话路径都在各自的数据目录里。
+数据目录由安装方式决定（npm / GitHub / tarball → `node_modules` 上级的 `.dsh-webui-auth/`；link / 源码 → 插件源码目录；兜底 `$DSH_HOME/dsh-webui-auth/`），忘记密码、审计、会话路径均指该目录。
 
 ## 审计日志
 

@@ -4,6 +4,11 @@ dsh-webui-auth.json
 # 审计日志（含用户名/IP/UA 等安全事件）——切勿提交
 audit.jsonl
 
+# 会话令牌、审计 HMAC 密钥、setup token——切勿提交
+sessions.jsonl
+audit-hmac-key
+setup-token
+
 # 通用忽略
 *.log
 .DS_Store
