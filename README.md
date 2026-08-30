@@ -13,12 +13,13 @@ DSH WebUI 身份认证插件（持久化插件）。在「设置 → 身份认�
 | WebUI 资源（index.html、/assets/*、SPA 路由） | 插件注册 `prefix ''` 兜底路由，校验会话后转交 frontend-static | 302 → 登录页 |
 | 插件 bundle（/plugins/*） | 运行时包装 `/plugins` 前缀路由 handler | 401 |
 | /api RPC 接口 | 运行时包装 `/api` 前缀路由 handler | 401 |
-| WebSocket（/api/events.mux、/api/events.host） | 运行时包装 upgrade 路由 handler | 401 拒绝升级 |
+| WebSocket（`/api/remote.mux`；旧核心 `/api/events.mux`、`/api/events.host`） | 运行时包装 upgrade 路由 handler | 401 拒绝升级 |
 
-- **不修改核心包**：dsh 升级不会覆盖补丁、不会产生「升级后 /api 裸奔」的窗口。插件每次启动对路由表重做包装，并用 2s→10s 重扫捕获晚注册路由。
+- **不修改核心包**：dsh 升级不会覆盖补丁、不会产生「升级后 /api 裸奔」的窗口。插件每次启动对路由表重做包装，并用 2s→10s 重扫捕获晚注册路由。**v0.1.2-alpha.2 及更新核心的事件流 WebSocket 位于 `/api/remote.mux`（由 dsh-api-gateway 注册），候选列表自动适配，不再误报「upgrade 路由缺失」。**
 - **fail-closed**：若预期路由缺失（dsh 内部结构变化导致包装不上），`setup`/`configure` 会**拒绝启用认证**，并在宿主日志与设置页同时报错——宁可不可用，不可「开了登录却裸奔 /api」。
-- **反代/局域网下的特权方法**：已认证请求由插件在会话校验后以「回环形状」转交核心，使核心中**回环钉死的特权方法**（settings/credentials/agentPreset/llm.discoverModels）在反代部署下可用——会话 Cookie 闸门是比 Host 启发式更强的身份证明。
-- **WebSocket 与 trustedHosts**：WS 升级握手仍受核心自身 `isTrustedApiRequest` 限制，因此**反代/局域网（非回环 Host）部署下，WS 下行需要同时在 dsh 配置中把对外域名加入 `client-connection.trustedHosts`**，否则即使已登录也会被拒绝升级。
+- **与核心自带浏览器认证（v0.1.2-alpha.2+）协作**：该版本核心自带 launch-token 交换的签名 Cookie（`dsh-auth-*`）认证 `/` 与 `/api`。插件登录成功后自动把浏览器引导到核心的带 token 根 URL 完成核心 Cookie 交换；`/api` 请求在插件会话校验后**原样转交**给核心（不再改写 Host/Origin，避免破坏核心 Cookie 与 Host 绑定）。两者叠加：浏览器须同时持有插件会话 Cookie 与核心 Cookie。
+- **反代/局域网旧核心下的特权方法**（≤alpha.1）：已认证请求由插件在会话校验后以「回环形状」转交核心，使核心中**回环钉死的特权方法**（settings/credentials/agentPreset/llm.discoverModels）在反代部署下可用——会话 Cookie 闸门是比 Host 启发式更强的身份证明。
+- **WebSocket 与 trustedHosts**：WS 升级握手仍受核心自身 `requestRejection` / `isTrustedApiRequest` 限制，因此**反代/局域网（非回环 Host）部署下，WS 下行需要同时在 dsh 配置中把对外域名加入 `client-connection.trustedHosts`**，否则即使已登录也会被拒绝升级。
 
 会话为**服务端会话，持久化到磁盘**（`sessions.jsonl`，重启 DSH 不掉线，到期自动失效），由 `HttpOnly; SameSite=Lax` Cookie（`dsh_wua_session`）携带，JS 无法读取；修改密码会**吊销所有其他会话**。
 
@@ -128,7 +129,9 @@ npx @deepseek-ai/dsh plugin --profile web add github:Yuuz12/dsh-webui-auth
 
 ## 升级 DSH 后的操作流程
 
-**无需任何操作**：插件不修改核心包，dsh 升级后启动时自动重做路由包装。若包装不完整（dsh 内部结构变化），宿主日志输出 `ROUTE GATE INCOMPLETE`、设置页显示红色警告，且 `setup`/`configure` 拒绝启用认证（fail-closed）。
+**无需任何操作**：插件不修改核心包，dsh 升级后启动时自动重做路由包装。**v0.1.2-alpha.2 及更新核心**：插件自动适配 `/api/remote.mux` 事件流路由，并与核心自带浏览器认证（launch-token ↔ 签名 Cookie）协作——登录插件后浏览器会被自动引导完成核心认证，随后 WebUI 正常使用。若包装不完整（dsh 内部结构变化），宿主日志输出 `ROUTE GATE INCOMPLETE`、设置页显示红色警告，且 `setup`/`configure` 拒绝启用认证（fail-closed）。
+
+> **注意（v0.1.2-alpha.2+）**：核心自带浏览器认证要求浏览器先通过 launch-token 换取核心 Cookie（`dsh web` / DSH Desktop 打印的带 `?token=` 的地址）。插件已自动处理该交换；如浏览器此前从未访问过该地址，请使用 DSH 启动时打印的完整 URL 打开一次（或从插件登录页登录，流程会自动完成交换）。
 
 ## 数据与安全
 

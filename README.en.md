@@ -13,12 +13,13 @@ Authentication is enforced in four layers, all implemented by **wrapping the web
 | WebUI resources (index.html, /assets/*, SPA routes) | Plugin registers a `prefix ''` catch-all route; after session validation it hands off to frontend-static | 302 → login page |
 | Plugin bundles (/plugins/*) | Wraps the `/plugins` prefix route handler at runtime | 401 |
 | /api RPC surface | Wraps the `/api` prefix route handler at runtime | 401 |
-| WebSocket (/api/events.mux, /api/events.host) | Wraps the upgrade route handlers at runtime | 401 upgrade rejected |
+| WebSocket (`/api/remote.mux`; legacy cores `/api/events.mux`, `/api/events.host`) | Wraps the upgrade route handlers at runtime | 401 upgrade rejected |
 
-- **No core patching**: a DSH upgrade never overwrites patches and never leaves `/api` exposed after an upgrade. Every startup re-wraps the route tables, with a 2s→10s rescan loop that catches late-registered routes.
+- **No core patching**: a DSH upgrade never overwrites patches and never leaves `/api` exposed after an upgrade. Every startup re-wraps the route tables, with a 2s→10s rescan loop that catches late-registered routes. **On v0.1.2-alpha.2+ the event-stream WebSocket lives at `/api/remote.mux` (registered by dsh-api-gateway); the candidate list adapts automatically, so the plugin no longer falsely reports "upgrade route missing".**
 - **Fail-closed**: if the expected routes are missing (DSH internals changed so wrapping can't apply), `setup`/`configure` **refuse to enable authentication** and the problem is reported both in the host log and on the settings page — better unusable than "login enabled with an unprotected /api".
-- **Privileged methods behind a reverse proxy / LAN**: after the session check the plugin hands authenticated requests to the core in a "loopback shape", so the core's **loopback-pinned privileged methods** (settings/credentials/agentPreset/llm.discoverModels) work in proxied deployments — the session-cookie gate is a strictly stronger identity proof than the Host-header heuristic it replaces.
-- **WebSocket and `trustedHosts`**: the WS upgrade handshake still goes through the core's own `isTrustedApiRequest`, so **in reverse-proxy / LAN deployments (non-loopback Host) you must also add the public hostname to `client-connection.trustedHosts` in the DSH config**, otherwise even authenticated upgrades are rejected.
+- **Cooperation with the core's own browser auth (v0.1.2-alpha.2+)**: that core version ships launch-token exchange with an origin-bound signed cookie (`dsh-auth-*`) guarding `/` and `/api`. After a successful plugin login the browser is automatically sent to the core's token-bearing root URL so the core cookie exchange runs too; `/api` requests pass through **unchanged** after the plugin session check (no more Host/Origin rewrite, which would break the core's cookie/Host binding). Both gates apply: a browser must hold the plugin session cookie **and** the core cookie.
+- **Privileged methods behind a reverse proxy / LAN (legacy cores ≤ alpha.1)**: after the session check the plugin hands authenticated requests to the core in a "loopback shape", so the core's **loopback-pinned privileged methods** (settings/credentials/agentPreset/llm.discoverModels) work in proxied deployments — the session-cookie gate is a strictly stronger identity proof than the Host-header heuristic it replaces.
+- **WebSocket and `trustedHosts`**: the WS upgrade handshake still goes through the core's own `requestRejection` / `isTrustedApiRequest`, so **in reverse-proxy / LAN deployments (non-loopback Host) you must also add the public hostname to `client-connection.trustedHosts` in the DSH config**, otherwise even authenticated upgrades are rejected.
 
 Sessions are **server-side and persisted to disk** (`sessions.jsonl`, survive a DSH restart, expire server-side), carried by an `HttpOnly; SameSite=Lax` cookie (`dsh_wua_session`) that JS cannot read; changing the password **revokes every other session**.
 
@@ -128,7 +129,9 @@ Both the login page and the "Settings → 身份认证 (Authentication)" setting
 
 ## What to do after upgrading DSH
 
-**Nothing.** The plugin never modifies core packages — after a DSH upgrade the runtime route wrapping is re-applied automatically on startup. If the wrapping is incomplete (DSH internals changed), the host log prints `ROUTE GATE INCOMPLETE`, the settings page shows a red warning, and `setup`/`configure` refuse to enable authentication (fail-closed).
+**Nothing.** The plugin never modifies core packages — after a DSH upgrade the runtime route wrapping is re-applied automatically on startup. **On v0.1.2-alpha.2+** the plugin adapts to the `/api/remote.mux` event-stream route and cooperates with the core's built-in browser auth (launch-token ↔ signed cookie): after logging into the plugin, the browser is automatically guided through the core authentication, after which the WebUI works normally. If the wrapping is incomplete (DSH internals changed), the host log prints `ROUTE GATE INCOMPLETE`, the settings page shows a red warning, and `setup`/`configure` refuse to enable authentication (fail-closed).
+
+> **Note (v0.1.2-alpha.2+)**: the core's browser auth requires the browser to first exchange the launch token for the core cookie (the `?token=` URL printed by `dsh web` / DSH Desktop). The plugin performs that exchange automatically; if a browser has never visited that address, open the full URL printed at DSH startup once (or log in via the plugin's login page — the exchange happens automatically).
 
 ## Data & Security
 

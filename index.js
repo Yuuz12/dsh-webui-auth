@@ -29,6 +29,23 @@
  *       raw addresses (the HMAC key is generated once and stored next to
  *       the credentials with 0600 permissions).
  *
+ * 0.3.2 — v0.1.2-alpha.2 core compatibility (by dsh adaption):
+ *
+ *   C1. Event-stream WebSocket moved from /api/events.mux+/api/events.host
+ *       to /api/remote.mux (owned by dsh-api-gateway). The gate now wraps
+ *       whichever of those upgrade routes exist, so it can never again report
+ *       a permanent "upgrade route not registered" failure on alpha.2+.
+ *   C2. alpha.2 core ships its own Connection browser auth (launch-token
+ *       exchange → origin-bound signed cookie) protecting / and /api. The
+ *       old loopback deputy (Host rewrite + Origin/Fetch-Metadata strip) is
+ *       therefore only applied against legacy cores that still carry the
+ *       PRIVILEGED_METHODS fence — on alpha.2+ the request passes through
+ *       untouched so the core's own cookie/Host fence decides.
+ *   C3. After a successful plugin login/setup the browser is redirected to
+ *       the core's authenticated root URL (launch-token query) so the core
+ *       cookie exchange runs too; without it the core would 401 every /api
+ *       call and the index page, dead-locking the session behind two gates.
+ *
  * Upstream credit: authentication architecture, login page, settings UI,
  * and the scrypt credential format originate from Yuuz12/dsh-webui-auth
  * (MIT). This fork keeps the on-disk formats compatible where possible.
@@ -37,7 +54,7 @@
  *   - prefix ""    : SPA resources (302 to login page)
  *   - prefix "/plugins": client plugin bundles (302 to login page)
  *   - prefix "/api"     : RPC surface (401)
- *   - upgrades /api/events.mux + /api/events.host : (reject upgrade)
+ *   - upgrades /api/remote.mux (+ legacy /api/events.mux, /api/events.host): (reject upgrade)
  *
  * Sessions: server-side, persisted across restarts (H3), carried by an
  * HttpOnly cookie `dsh_wua_session`; changing the password revokes every
@@ -664,7 +681,7 @@ f.addEventListener('submit', function (ev) {
   fetch(MODE === 'setup' ? '/dsh-webui-auth/setup' : '/dsh-webui-auth/login', {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body)
   }).then(function (r) { return r.json(); }).then(function (r) {
-    if (r && r.ok) { location.href = '/'; return; }
+    if (r && r.ok) { location.href = (r.redirect && typeof r.redirect === 'string') ? r.redirect : '/'; return; }
     b.disabled = false; b.textContent = MODE === 'setup' ? '创建账号' : '登录';
     if (r && r.error === 'rate-limited') show('尝试次数过多，请一分钟后重试');
     else if (r && r.error === 'setup-token-required') show('初始化令牌缺失或不正确（见 dsh 启动日志）');
@@ -694,8 +711,9 @@ f.addEventListener('submit', function (ev) {
 
 const API_PREFIX = '/api'
 const PLUGINS_PREFIX = '/plugins'
-const MUX_PATH = '/api/events.mux'
-const HOST_PATH = '/api/events.host'
+// alpha.2 起事件流 WebSocket 由 dsh-api-gateway 的 /api/remote.mux 承载；
+// 旧的 events.mux/events.host 已删除。候选列表按"存在即包装"，兼容新旧核心。
+const UPGRADE_CANDIDATES = ['/api/remote.mux', '/api/events.mux', '/api/events.host']
 
 function rejectUpgrade401(socket) {
   try {
@@ -720,21 +738,28 @@ function installRouteGate(ctx, checkRequest, log) {
   const wrapHttp = (route, opts) => {
     const original = route.handler
     const loopbackDeputy = !!(opts && opts.loopbackDeputy)
+    // alpha.2 起核心自带 Connection 浏览器认证（BrowserAuth + trusted-host fence）：
+    // /api handler 内建 requestRejection，且 browser cookie 按 Host authority 绑定 ——
+    // 再改写 Host/Origin 会破坏 cookie 匹配。仅旧核心（无 connection.requestRejection）
+    // 需要 loopback 伪装来通过 PRIVILEGED_METHODS fence。
+    let coreHasRequestGate = false
+    try {
+      const connection = ctx.get('connection')
+      coreHasRequestGate = !!(connection && typeof connection.requestRejection === 'function')
+    } catch (e) { coreHasRequestGate = false }
+    const useDeputy = loopbackDeputy && !coreHasRequestGate
     const wrapped = async (req, res) => {
       if (!checkRequest(req)) {
         res.writeHead(401, { 'content-type': 'text/plain; charset=utf-8' })
         res.end('unauthorized')
         return
       }
-      if (loopbackDeputy) {
-        // Authenticated + this is the /api surface: present the request to the
-        // core as loopback so PRIVILEGED_METHODS' strict fence (settings.*,
-        // credentials.*, agentPreset.*, llm.discoverModels) admits it. Our
-        // session gate already proved operator identity — strictly stronger
-        // than the Host-header heuristic it replaces for these callers.
-        // The fence also compares Origin.host to Host and rejects cross-site
-        // Fetch Metadata; a reverse-proxied request carries the public origin,
-        // so both are normalized alongside Host to the loopback deputy shape.
+      if (useDeputy) {
+        // Authenticated + this is the /api surface on a legacy core: present the request
+        // to the core as loopback so PRIVILEGED_METHODS' strict fence (settings.*,
+        // credentials.*, agentPreset.*, llm.discoverModels) admits it. Our session gate
+        // already proved operator identity — strictly stronger than the Host-header
+        // heuristic it replaces for these callers.
         req.headers.host = '127.0.0.1'
         // Origin/Fetch-Metadata 一并移除：以"非浏览器回环客户端"形状呈现。
         // 不能只改写 Origin 的 host——Host 带 127.0.0.1:3080 端口而改写后的
@@ -777,16 +802,20 @@ function installRouteGate(ctx, checkRequest, log) {
         problems.add(`prefix route "${pfx}" not registered yet`)
       }
     }
-    for (const path of [MUX_PATH, HOST_PATH]) {
+    // alpha.2 起仅存在 /api/remote.mux（由 api-gateway 注册）；旧核心仍用
+    // events.mux/events.host。候选列表兼容两代：已注册的全部包装，其余不计问题。
+    for (const path of UPGRADE_CANDIDATES) {
       const r = ws.upgrades.get(path)
       if (r !== undefined && !wrapped.has(r)) {
         wrapped.add(r)
         undos.push(wrapUpgrade(r))
-        problems.delete(`upgrade route "${path}" not registered yet`)
         log(`wrapped upgrade route ${path}`)
-      } else if (r === undefined) {
-        problems.add(`upgrade route "${path}" not registered yet`)
       }
+    }
+    if (UPGRADE_CANDIDATES.every((path) => ws.upgrades.get(path) === undefined)) {
+      problems.add('no upgrade route registered yet (looked for ' + UPGRADE_CANDIDATES.join(', ') + ')')
+    } else {
+      problems.delete('no upgrade route registered yet (looked for ' + UPGRADE_CANDIDATES.join(', ') + ')')
     }
   }
 
@@ -842,6 +871,24 @@ function themePreference(ctx) {
     return (preference === 'light' || preference === 'dark') ? preference : THEME_PREFERENCE_DEFAULT
   } catch (e) {
     return THEME_PREFERENCE_DEFAULT
+  }
+}
+
+// alpha.2 起核心自带 Connection 浏览器认证：/ 与 /api 需要 launch-token 换取的
+// 签名 cookie。插件登录成功只是第一道门，还必须引导浏览器完成核心的
+// token→cookie 交换，否则后续请求会被核心 401 拦截（死锁）。
+// authenticatedUrl(baseUrl) 返回带本进程 launch token 的应用根 URL。
+// baseUrl 用请求自身的 Host（保持反代/LAN 场景的 authority 一致）。
+function postLoginRedirect(ctx, req) {
+  try {
+    const conn = ctx.get('connection')
+    if (!conn || typeof conn.authenticatedUrl !== 'function') return '/'
+    const host = (req && req.headers && typeof req.headers.host === 'string' && req.headers.host)
+      ? req.headers.host
+      : ('127.0.0.1:' + String((ctx.get('webServer') && ctx.get('webServer').port) || ''))
+    return conn.authenticatedUrl('http://' + host)
+  } catch (e) {
+    return '/'
   }
 }
 
@@ -1002,7 +1049,7 @@ export async function apply(ctx) {
           const s = createSession(username, ttlOf(creds))
           res.setHeader('Set-Cookie', sessionCookie(s.token, s.maxAge))
           await auditLog(ctx, 'login_success', { username, ip: meta.ip, ua: meta.ua })
-          sendJson(res, 200, { ok: true })
+          sendJson(res, 200, { ok: true, redirect: postLoginRedirect(ctx, req) })
           return
         }
         sendJson(res, 405, { error: '仅支持 GET/POST' })
@@ -1063,7 +1110,7 @@ export async function apply(ctx) {
         const s = createSession(username, TTL_DEFAULT)
         res.setHeader('Set-Cookie', sessionCookie(s.token, s.maxAge))
         await auditLog(ctx, 'setup_success', { username, ip: meta.ip, ua: meta.ua })
-        sendJson(res, 200, { ok: true })
+        sendJson(res, 200, { ok: true, redirect: postLoginRedirect(ctx, req) })
       } catch (e) {
         sendJson(res, 500, { error: e && e.message ? e.message : String(e) })
       }
@@ -1282,6 +1329,20 @@ export async function apply(ctx) {
     handler: async (req, res) => {
       try {
         if (checkRequest(req)) {
+          // alpha.2+：插件会话通过后，核心 BrowserAuth 可能仍未认领该浏览器
+          // （核心 cookie 缺失/过期）。主动引导去带 launch token 的根 URL 完成
+          // 核心 token→cookie 交换，否则 fallback 的 authorizeIndex 会 401 死锁。
+          // 请求已带 token（核心正在交换中/前端保留 query）时不再跳转。
+          const connection = ctx.get('connection')
+          if (connection && typeof connection.requestRejection === 'function') {
+            let hasToken = false
+            try { hasToken = new URL(req.url || '/', 'http://x').searchParams.has('token') } catch (e) { /* ignore */ }
+            if (!hasToken && connection.requestRejection(req) === 401) {
+              res.writeHead(302, { location: postLoginRedirect(ctx, req) })
+              res.end()
+              return
+            }
+          }
           const fallback = ctx.webServer.fallback
           if (fallback !== undefined) {
             await fallback(req, res)
