@@ -16,3 +16,4 @@ Thumbs.db
 
 # 本地工作状态（agent 记忆、会话归档等），不随仓库分发
 .workbuddy/
+.workbuddy-ai/

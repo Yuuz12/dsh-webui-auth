@@ -29,6 +29,23 @@
  *       raw addresses (the HMAC key is generated once and stored next to
  *       the credentials with 0600 permissions).
  *
+ * 0.3.5 — desktop marker pass-through (fixes #8):
+ *
+ *   C5. DSH Desktop 的 advanced / extended 模式会在组合层禁用核心 ui-layout 行，
+ *       此时客户端 layout 服务的唯一提供者是桌面端自己的客户端插件，而它只在
+ *       URL 带 dsh-desktop-* 标记时才生效。任何一次落到干净 "/" 的跳转都会丢掉
+ *       这些标记，导致 12 个依赖 layout 的客户端插件停在 pending、渲染器 30s
+ *       不上报健康、宿主弹出恢复模式对话框。已确认两条丢标记路径：
+ *         ① 首次登录：核心 token→cookie 交换把浏览器 303 到干净的 "/"；
+ *         ② 退出后重登：客户端自行 location.href = '/'，服务端从头到尾没看到
+ *            那个带标记的 URL 被放弃，无从在跳转前暂存。
+ *       最终实现是「主动记忆 + 补投」：渲染器正常加载时就把标记落盘，之后任何
+ *       一步丢标记都能补投回来（0.3.4 曾用「跳转前才暂存」，覆盖不到路径 ②）。
+ *
+ *       本修复**全部隔离在 lib/desktop-adapter.js**，本文件只保留两处调用点
+ *       （网关里的「宿主适配层」代码块）。摘除适配、了解设计取舍、新增其它适配，
+ *       都看那个文件的头部注释，不必读本文件。
+ *
  * 0.3.3 — post-login redirect scheme (fixes #6 / #7):
  *
  *   C4. postLoginRedirect() no longer hardcodes "http://". The scheme is now
@@ -78,6 +95,9 @@ import { readFileSync, writeFileSync, appendFileSync, accessSync, mkdirSync, unl
 import { fileURLToPath } from "node:url";
 import { resolve as resolvePath } from "node:path";
 import { promisify } from "node:util";
+// 宿主适配层（DSH Desktop 的 dsh-desktop-* 标记透传）。
+// 整体摘除：删掉本行 + 网关里两处标着「宿主适配层」的代码块 + lib/desktop-adapter.js。
+import { desktopAdapter } from './lib/desktop-adapter.js';
 
 export const name = 'dsh-webui-auth'
 
@@ -135,7 +155,11 @@ async function dummyVerify(password) {
 }
 
 // 供测试与工具脚本使用（Cordis 加载时只消费 name/inject/apply，多余导出无副作用）
-export { hashPassword, verifyPassword, auditLog, readAuditEntries, resolveDataDirFrom, DATA_DIR, resolveRedirectScheme, postLoginRedirect }
+// DSH Desktop 适配层的纯函数在 lib/desktop-adapter.js 里自行导出，不经过本模块。
+export {
+  hashPassword, verifyPassword, auditLog, readAuditEntries, resolveDataDirFrom, DATA_DIR,
+  resolveRedirectScheme, postLoginRedirect,
+}
 
 // ---------------- 数据目录与文件 ----------------
 
@@ -1448,7 +1472,18 @@ export async function apply(ctx) {
     path: '',
     handler: async (req, res) => {
       try {
+        // ─────── 宿主适配层（DSH Desktop）· 整体摘除时删掉本块 ───────
+        // 必须在认证判定之前：退出登录是客户端自己 location.href = '/'，
+        // 服务端看不到带标记的 URL 被放弃，只能在加载时提前记住。
+        desktopAdapter.remember(req, res)
+        // ──────────────────────────────────────────────────────────
         if (checkRequest(req)) {
+          // ─────── 宿主适配层（DSH Desktop）· 整体摘除时删掉本块 ───────
+          // 核心 token→cookie 交换会把浏览器 303 到干净的 "/"，桌面端
+          // advanced / extended 模式依赖 URL 上的 dsh-desktop-* 标记才会接管
+          // layout 服务，这里把记住的标记补回 URL 再放行。
+          if (desktopAdapter.restore(req, res)) return
+          // ──────────────────────────────────────────────────────────
           // alpha.2+：插件会话通过后，核心 BrowserAuth 可能仍未认领该浏览器
           // （核心 cookie 缺失/过期）。主动引导去带 launch token 的根 URL 完成
           // 核心 token→cookie 交换，否则 fallback 的 authorizeIndex 会 401 死锁。

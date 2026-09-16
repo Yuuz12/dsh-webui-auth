@@ -22,6 +22,12 @@ DSH WebUI 身份认证插件（持久化插件）。在「设置 → 身份认�
 - **WebSocket 与 trustedHosts**：WS 升级握手仍受核心自身 `requestRejection` / `isTrustedApiRequest` 限制，因此**反代/局域网（非回环 Host）部署下，WS 下行需要同时在 dsh 配置中把对外域名加入 `client-connection.trustedHosts`**，否则即使已登录也会被拒绝升级。
 - **登录后跳转的协议自适应（0.3.3，修 #6 / #7）**：插件登录成功后要把浏览器引导到核心的带 token 根地址，其 **authority 取自本次请求的 Host**（不再写死 `127.0.0.1`），**scheme 按请求实际协议解析**，优先级：① 操作者显式声明 `remote-web-ui.publicBaseUrl`（**仅当其 host/port 与本次请求 Host 一致时**采信——否则局域网直连会被重定向到公网地址、跨源丢掉刚下发的会话 Cookie）；② 标准代理头 `X-Forwarded-Proto`（取最左值）或 RFC 7239 `Forwarded: proto=`；③ socket 自身是 TLS（插件直接终结 TLS）；④ 兜底 `http`。**刻意不做「非 IP 域名即 https」的猜测**——那会把纯 http 的内网域名访问（`http://nas.local:3080`）打成 https 死链。前端登录页另有一层单向兜底：页面在 https 下收到**同源** `http://` 跳转时自动升级为 `https://`（反向不降级、异源不改写）。
 
+- **桌面端标记透传（0.3.5，修 #8）**：DSH Desktop 的 `advanced` / `extended` 模式会在组合层**禁用核心 `ui-layout` 行**，此时客户端 `layout` 服务的唯一提供者是桌面端自己的客户端插件，而它**只在 URL 带 `dsh-desktop-*` 标记时才生效**（标记缺失时 `parseDesktopClientEnvironment()` 返回 undefined，`apply()` 直接 return）。任何一次落到干净 `/` 的跳转都会丢掉这些标记 → 12 个依赖 `layout` 的客户端插件永远停在 `pending` → 渲染器 30s 不上报健康 → 宿主弹出「部分插件加载失败」恢复模式对话框。
+  已确认两条丢标记的路径：① **首次登录**——核心 token→cookie 交换把浏览器 303 到干净的 `/`；② **退出后重登**——退出登录是客户端自行 `location.href = '/'`，服务端从头到尾没看到那个带标记的 URL 被放弃。
+  对策是**主动记忆**：渲染器正常加载（URL 带标记）时就把标记写进 Cookie（`dsh_wua_desktop`，HttpOnly / SameSite=Lax / 12h），此后任何一步丢标记，只要文档请求落到干净的 `/`，就 302 回带标记的 URL。补投发生在**文档加载之前**，与客户端插件之间不存在竞态。暂存**刻意不清除**——清除会引入「记住 → 立刻清掉 → 退出后无处可补」的时序陷阱，过期交给 Max-Age。
+  标记按 `dsh-desktop-` 前缀**整体透传**（刻意不做硬编码白名单——DSH Desktop 将来新增一个标记时会再次静默弄坏桌面端启动，正是本 issue 的同类耦合），其中 `mode` 必须是 `compatibility`/`extended`/`advanced` 之一、值长度上限 64；跳转目标恒为同源相对路径 `/`，**无开放重定向面**；网页版（无 `dsh-desktop-*` 标记）零影响。
+  这套适配**全部隔离在 `lib/desktop-adapter.js`**，`index.js` 只保留网关里的两处调用点（标着「宿主适配层」）。该模块不 import 主模块任何东西，可整体摘除；文件头写明了设计取舍、移除步骤，以及新增其它宿主适配的接口约定（`{ remember(req,res), restore(req,res) }`）。
+
 会话为**服务端会话，持久化到磁盘**（`sessions.jsonl`，重启 DSH 不掉线，到期自动失效），由 `HttpOnly; SameSite=Lax` Cookie（`dsh_wua_session`）携带，JS 无法读取；修改密码会**吊销所有其他会话**。
 
 ## 安装
