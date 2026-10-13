@@ -16,6 +16,7 @@ DSH WebUI 身份认证插件（持久化插件）。在「设置 → 身份认�
 | WebSocket（`/api/remote.mux`；旧核心 `/api/events.mux`、`/api/events.host`） | 运行时包装 upgrade 路由 handler | 401 拒绝升级 |
 
 - **不修改核心包**：dsh 升级不会覆盖补丁、不会产生「升级后 /api 裸奔」的窗口。插件每次启动对路由表重做包装，并用 2s→10s 重扫捕获晚注册路由。**v0.1.2-alpha.2 及更新核心的事件流 WebSocket 位于 `/api/remote.mux`（由 dsh-api-gateway 注册），候选列表自动适配，不再误报「upgrade 路由缺失」。**
+- **同前缀的顶层 exact 路由同样纳管（0.3.6）**：路由表对 `exact` 的优先级高于 `prefix`，只包装 prefix 会漏掉 client-hmr 的 `/plugins/events`（SSE 通道）这类成员——0.3.5 及更早版本实测匿名 GET 即可读到**整个客户端插件图**（插件 id、bundle URL、revision）并长期挂着接收 rebuild 事件。现在 `/api`、`/plugins` 前缀下的顶层 exact 路由会被逐个包装（含晚注册重扫）；插件自身端点（`/dsh-webui-auth/*`）不在受保护前缀下，不受影响。
 - **fail-closed**：若预期路由缺失（dsh 内部结构变化导致包装不上），`setup`/`configure` 会**拒绝启用认证**，并在宿主日志与设置页同时报错——宁可不可用，不可「开了登录却裸奔 /api」。
 - **与核心自带浏览器认证（v0.1.2-alpha.2+）协作**：该版本核心自带 launch-token 交换的签名 Cookie（`dsh-auth-*`）认证 `/` 与 `/api`。插件登录成功后自动把浏览器引导到核心的带 token 根 URL 完成核心 Cookie 交换；`/api` 请求在插件会话校验后**原样转交**给核心（不再改写 Host/Origin，避免破坏核心 Cookie 与 Host 绑定）。两者叠加：浏览器须同时持有插件会话 Cookie 与核心 Cookie。
 - **反代/局域网旧核心下的特权方法**（≤alpha.1）：已认证请求由插件在会话校验后以「回环形状」转交核心，使核心中**回环钉死的特权方法**（settings/credentials/agentPreset/llm.discoverModels）在反代部署下可用——会话 Cookie 闸门是比 Host 启发式更强的身份证明。
@@ -27,6 +28,13 @@ DSH WebUI 身份认证插件（持久化插件）。在「设置 → 身份认�
   对策是**主动记忆**：渲染器正常加载（URL 带标记）时就把标记写进 Cookie（`dsh_wua_desktop`，HttpOnly / SameSite=Lax / 12h），此后任何一步丢标记，只要文档请求落到干净的 `/`，就 302 回带标记的 URL。补投发生在**文档加载之前**，与客户端插件之间不存在竞态。暂存**刻意不清除**——清除会引入「记住 → 立刻清掉 → 退出后无处可补」的时序陷阱，过期交给 Max-Age。
   标记按 `dsh-desktop-` 前缀**整体透传**（刻意不做硬编码白名单——DSH Desktop 将来新增一个标记时会再次静默弄坏桌面端启动，正是本 issue 的同类耦合），其中 `mode` 必须是 `compatibility`/`extended`/`advanced` 之一、值长度上限 64；跳转目标恒为同源相对路径 `/`，**无开放重定向面**；网页版（无 `dsh-desktop-*` 标记）零影响。
   这套适配**全部隔离在 `lib/desktop-adapter.js`**，`index.js` 只保留网关里的两处调用点（标着「宿主适配层」）。该模块不 import 主模块任何东西，可整体摘除；文件头写明了设计取舍、移除步骤，以及新增其它宿主适配的接口约定（`{ remember(req,res), restore(req,res) }`）。
+
+- **宿主直连信任桥（0.3.6，修 #9）**：官方桌面端（DSH Desktop）的渲染器文档与静态资源由 shell 自己从本地 dist 提供，其余请求经 `forwardWebRequest` 转发给宿主——而该转发用 Node 全局 `fetch`，并**把响应里的 `set-cookie` 一并丢弃**。插件下发的会话 Cookie 在桌面端**永远落不了地**，于是桌面端在插件眼里始终「未登录」：`/api`、`/plugins`、WebSocket 全 401，设置页整片打不开。更早一步还会直接卡死启动：shell 启动时用本进程 launch token 换核心自己的 Cookie，要求宿主回 **303 + set-cookie**（`authenticateWebHost`，`redirect:"manual"`），插件的文档闸门原先回 302 → 桌面端抛 `Desktop Host authentication failed` → 恢复模式对话框（只能选「禁用第三方插件」）。
+  0.3.6 改为给「**已经被核心自己认证过的回环宿主直连**」让路，而不是再加一道它无法满足的门：
+  - `coreAdmitsHost()`——核心的信任栅栏 + 浏览器会话校验已放行该请求（即官方扩展点 `ctx.connection.admit(request)` 会答出 operator），用于 `/api`、`/plugins`、WebSocket 与插件自身端点；
+  - `coreTokenExchange()`——该请求就是核心自己的 token→cookie 交换（`GET /?token=<本进程令牌>`），原样交给核心，让它下发 303 + Set-Cookie。
+
+  两者**只对回环 socket 生效**；文档闸门（SPA / 资源）刻意只放行 token 交换、**不**接受 `coreAdmitsHost`，所以**浏览器访问 WebUI 依旧会看到登录页**，远端/隧道客户端依旧必须输入口令。回环本身已在信任边界之内（同机进程可直接读数据目录里的会话令牌与核心签名密钥），因此这不让渡任何实际可利用面；核心结构变化（拿不到 `connection` 服务）时两个判定都返回 false，闸门退回严格形态——fail-closed。
 
 会话为**服务端会话，持久化到磁盘**（`sessions.jsonl`，重启 DSH 不掉线，到期自动失效），由 `HttpOnly; SameSite=Lax` Cookie（`dsh_wua_session`）携带，JS 无法读取；修改密码会**吊销所有其他会话**。
 
@@ -61,10 +69,49 @@ npx @deepseek-ai/dsh plugin --profile web add github:Yuuz12/dsh-webui-auth
 ```
 
 > 维护者开发模式：在本地源码目录使用 `dsh plugin --profile web add ./dsh-webui-auth`（`link:` 安装），改代码 → 重启 DSH 即生效，无需重新安装。
+>
+> 维护者验证：`npm test` 跑离线回归（`test/host-bridge.test.mjs` 覆盖宿主桥与闸门的全部准入分支）；`node test/desktop-host-e2e.mjs` 会拉起**真宿主**（同一 runtime、自由端口）复刻桌面端 shell 的每一条请求，验证 ① 303 + set-cookie、② `/api` RPC、③ `/plugins`（含 exact 路由）、④ WebSocket 升级、⑤ 口令闸门五组行为；加 `--preflight-desktop` 可预演真实 `desktop` profile 的组合（插件代码与数据都隔离在临时目录，不会碰到仓库里的会话文件）。`node test/desktop-live-check.mjs` 则是对**正在运行的桌面端**做只读自检（插件是否加载、闸门是否在守、`/plugins/events` 是否已被覆盖）。
 
 ### 所有方式通用
 
 安装后**无需任何核心包补丁**（无 `[dsh-webui-auth patch]` 标记、不改 `node_modules`），重启 DSH 即生效。插件启动时在宿主日志打印 `[dsh-webui-auth] started, credentials file: ...`；若路由包装不完整会打印 `ROUTE GATE INCOMPLETE`，此时认证无法启用（fail-closed）。
+
+### 在 DSH 桌面端使用（DSH Desktop）
+
+桌面端跑的是独立 profile `desktop`（`~/.dsh/profiles/desktop`），所以插件要装到**那个** profile：
+
+```sh
+npx @deepseek-ai/dsh plugin --profile desktop add dsh-webui-auth
+```
+
+也可以直接在插件管理面板里为 `desktop` profile 启用，或按「方式三」把挂载行写进 `profiles/desktop/cordis.patch.yml`。
+
+重启桌面端后，宿主日志应出现：
+
+```
+[dsh-webui-auth] host carrier bridge active (core token exchange + core-authenticated loopback requests)
+```
+
+看到这行就说明桥已就绪：桌面端窗口不再被登录页拦住，「设置 → 身份认证」会提示**当前连接走宿主直连通道**，账号密码管理与审计记录照常可用。口令闸门对浏览器照旧生效。
+
+- **桌面端锁（0.3.6）**：桌面端窗口**无法**在传输层要求口令——这是 shell 结构决定的：`forwardWebRequest` 转发前会**替换** `Cookie` 头（先 `delete('cookie')`，再注入 shell 手里的核心 Cookie），响应里的 `set-cookie` 又被丢弃（`WITHHELD_RESPONSE_HEADERS`），而渲染器的文档与静态资源还是 shell 从本地 dist 直接提供的（根本不进宿主）。所以插件会话 Cookie 永远进不了桌面端，服务端也就做不了口令判定。
+  0.3.6 改为 **UI 级锁**把这件事做对：桌面端每次加载先盖一层解锁界面，只有拿着有效解锁令牌才揭开；令牌由客户端自己保存——**「浏览器会话」存 sessionStorage（关掉或重启桌面端必须重新输口令，正是这个选项该有的语义）**，1 小时 / 1 天 / 3 天存 localStorage 且到期前免输。「退出登录并锁定」会**吊销服务端会话并立即重新上锁**，不再是"点了没反应"。
+  边界要说清楚：这是**界面锁**，挡的是「人离开时看到界面」，不是传输层闸门——桌面端的网络通道始终由 DSH 自身认证。锁的任何一步失败都会在 8 秒内自动放行，绝不会把桌面端锁死；忘记密码时按「忘记密码」流程删除插件数据目录的 `dsh-webui-auth.json` 后刷新即可解锁。
+- 想验证**传输层**口令闸门，请用**浏览器**打开 DSH 的地址（`dsh web` 打印的地址 / 局域网地址 / 反代地址）——那里才会出现登录页。
+
+- **0.3.5 及更早版本在桌面端会在启动时直接失败**（`Desktop Host authentication failed`，恢复模式对话框里只能选「禁用第三方插件」）；0.3.6 起适配，请先升级。
+- 若日志打印的是 `host carrier bridge unavailable: ...`，说明核心版本缺少 `connection.authenticatedUrl` 契约；此时闸门退回严格形态，桌面端会被拦（请连同该日志反馈）。
+
+重启后自查（两条只读命令，`19387` 是桌面端宿主固定端口）：
+
+```powershell
+# ① 插件是否已在桌面端宿主里生效 —— 返回 {"error":"unauthorized"} 即插件已加载、闸门已启用
+#    （插件未加载时这里不会有这个 JSON 体）
+curl.exe -s http://127.0.0.1:19387/dsh-webui-auth/status
+
+# ② 口令闸门是否仍在守门 —— 无凭据访问根路径应 302 到 /dsh-webui-auth/login
+curl.exe -s -i http://127.0.0.1:19387/ | Select-String 'HTTP/|location'
+```
 
 ## 卸载
 
@@ -153,6 +200,8 @@ npx @deepseek-ai/dsh plugin --profile web add github:Yuuz12/dsh-webui-auth
 
 ## 已知边界
 
+- **桌面端不经过口令闸门（0.3.6 起）**：桌面端渲染器的请求由 shell 代理转发，而代理不保存会话 Cookie（丢弃 `set-cookie`），自定义 scheme 页面也没有可用的 Cookie jar——所以桌面端只能凭「宿主直连」进入，无法「在桌面端里登录」。这在设计上等价于「桌面端本来就持有宿主启动令牌」，与「本机进程可直接读数据目录」同属既有信任边界；口令闸门守的是浏览器（`dsh web`、局域网、反代）这条线。
+- **宿主直连豁免只认回环**：非回环客户端即使持有核心 Cookie、或知道 launch token，也仍须口令登录（文档闸门只放行 token 交换、不接受核心已认证判定）。本机反代（caddy/cloudflared）与 SSH 隧道的 socket 在宿主看来也是回环、无法与桌面端区分，但这类访问者已在本机信任边界内（可读数据目录中的会话令牌）。
 - **运行时包装的固有窗口**：路由对象被替换（服务热重载）到下一次重扫之间（≤10s）存在未保护窗口；启用认证时的 fail-closed 已挡住「初始裸奔」，此窗口仅影响运行中的热重载场景。
 - **WS 与 trustedHosts**：反代/局域网（非回环 Host）下，WS 下行需在 dsh 配置 `client-connection.trustedHosts` 中加入对外域名（见「架构」节）。
 - **反代不同机**：若反代与 DSH 不在同一台机器（对端非回环），代理头不被信任，限流将按代理 IP 聚合（退化为全局桶）。

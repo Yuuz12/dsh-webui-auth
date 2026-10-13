@@ -29,6 +29,76 @@
  *       raw addresses (the HMAC key is generated once and stored next to
  *       the credentials with 0600 permissions).
  *
+ * 0.3.6 — DSH Desktop 适配（fixes #9）：宿主载体桥（C6/C7）+ 桌面端锁（C8）。
+ *
+ *   C8. 桌面端窗口**无法**在传输层要求口令，这是 shell 结构决定的，不是插件能绕过的：
+ *
+ *         · forwardWebRequest 在转发前 **替换** Cookie 头——先 delete('cookie')，
+ *           再 set('cookie', hostCookie)。渲染器带的任何 Cookie 都被丢掉，注入的
+ *           永远只有 shell 手里的核心 Cookie；
+ *         · 响应的 set-cookie 也在 WITHHELD_RESPONSE_HEADERS 里被丢弃，
+ *           插件下发的会话 Cookie 无处落地；
+ *         · 渲染器的文档与静态资源由 shell 从本地 dist 直接提供，根本不进宿主，
+ *           所以文档闸门也拦不到桌面端的页面加载。
+ *
+ *       于是桌面端在插件眼里永远是"核心已认证的宿主直连"，服务端做不了口令判定：
+ *       早期修订因此把「退出登录」按钮藏了起来，但那只是把问题盖住（用户反馈：
+ *       "为什么我登上以后不能退出登录了""设置为浏览器会话，重启桌面端也不要求登录"）。
+ *
+ *       0.3.6 改为**UI 级锁**，把这两件事做对：
+ *         · 桌面端每次加载先盖一层遮罩，只有拿着有效解锁令牌才揭开；令牌由客户端
+ *           自己保存——有效期"浏览器会话"(ttl=0) → sessionStorage（应用一关就没了，
+ *           重启桌面端必须重新输口令），1 小时/1 天/3 天 → localStorage + 到期时间；
+ *         · 「退出登录」在桌面端改为"吊销服务端会话 + 立即重新上锁"，名副其实；
+ *         · 服务端配合：宿主直连的登录响应额外返回解锁令牌（浏览器永远拿不到，
+ *           HttpOnly 语义不受影响），新增 /dsh-webui-auth/desktop-session 校验令牌，
+ *           /dsh-webui-auth/logout 接受请求体里的令牌以真正吊销会话。
+ *
+ *       边界必须说清楚：这把锁挡的是"人离开时看到界面"，**不是**传输层闸门——
+ *       桌面端的网络通道始终由 DSH 自身认证，任何能读宿主内存/数据的本地进程
+ *       本来就在信任边界内。锁的任何一步失败都会在 8 秒内自动放行，绝不把桌面端锁死。
+ *
+ *   —— 载体桥（C6/C7）：让桌面端不再被闸门挡死、并补齐 exact 路由覆盖 ——
+ *
+ *   C6. DSH Desktop 的 Host 进程与渲染器之间隔着一层 shell 代理，这一层决定了
+ *       桌面端**永远拿不到插件会话 Cookie**：
+ *
+ *         · 渲染器的文档与静态资源由 shell 自己从本地 dist 提供
+ *           （app.asar lib/main.js 的 protocol.handle："/"、"/index.html"、
+ *            "/assets/*" 直接 serveWebDocument），根本不进宿主；
+ *         · 其余路径（/api、/plugins/*…）走 forwardWebRequest 转发，而它用的是
+ *           Node 全局 fetch，并且把响应头里的 set-cookie 一并丢弃
+ *           （WITHHELD_RESPONSE_HEADERS）——宿主下发的会话 Cookie 无处落地。
+ *
+ *       于是桌面端在插件眼里永远是"未登录"：/api、/plugins、WebSocket 全 401，
+ *       设置页整片打不开。更早一步还会直接卡死启动：shell 启动时用本进程
+ *       launch token 去换核心自己的 Cookie，要求宿主回 303 + set-cookie
+ *       （main.js 的 authenticateWebHost，redirect:"manual"），而插件的文档闸门
+ *       回的是 302 → 抛 "Desktop Host authentication failed" → 恢复模式对话框。
+ *
+ *       修法是给"已经被核心自己认证过的宿主直连"让路，而不是再加一道它无法满足的
+ *       门（详见下面「宿主直连信任桥」一节）：
+ *
+ *         · coreAdmitsHost()  核心的信任栅栏 + 浏览器会话校验已放行该请求
+ *                             （即官方扩展点 ctx.connection.admit(request) 会给出
+ *                              operator）——用于 /api、/plugins、WebSocket 与插件自身端点；
+ *         · coreTokenExchange() 该请求就是核心自己的 token→cookie 交换
+ *                             （GET /?token=<本进程令牌>）——原样交给核心，让它下发
+ *                              303 + Set-Cookie。
+ *
+ *       两者**只对回环 socket 生效**，且文档闸门（SPA/资源）刻意只放行 token 交换、
+ *       不接受 coreAdmitsHost：浏览器访问 WebUI 时依旧会看到登录页，远端/隧道客户端
+ *       依旧必须输入口令。回环本身已在信任边界之内（本机进程可直接读插件数据目录里的
+ *       裸会话令牌与核心签名密钥），因此这不让渡任何实际可利用面。
+ *
+ *   C7. 顺带堵掉一条同类的旁路：顶层 **exact** 路由原先完全没被闸门覆盖。路由表对
+ *       exact 的优先级高于 prefix，因此 client-hmr 的 `/plugins/events`（SSE）匿名可读——
+ *       实测会把整个客户端插件图（插件 id、bundle URL、revision）推给任何未认证客户端，
+ *       并可长期挂着接收 rebuild 事件，与「未认证客户端无法加载资源或建立实时连接」的
+ *       承诺相矛盾。现在同前缀（/api、/plugins）的顶层 exact 路由逐个包装（含晚注册重扫）；
+ *       插件自身端点（/dsh-webui-auth/*）不在受保护前缀下，不受影响；桌面端同样不受影响
+ *       ——渲染器经 shell 转发的请求带核心 Cookie，走宿主直连放行。
+ *
  * 0.3.5 — desktop marker pass-through (fixes #8):
  *
  *   C5. DSH Desktop 的 advanced / extended 模式会在组合层禁用核心 ui-layout 行，
@@ -80,10 +150,20 @@
  * (MIT). This fork keeps the on-disk formats compatible where possible.
  *
  * Routes protected (all via runtime wrapping of the webServer service):
- *   - prefix ""    : SPA resources (302 to login page)
- *   - prefix "/plugins": client plugin bundles (302 to login page)
+ *   - prefix ""         : SPA resources (302 to login page)
+ *   - prefix "/plugins" : client plugin bundles (401)
+ *   - exact "/plugins/*": top-level exact routes under a protected prefix — the client-HMR
+ *                         /plugins/events SSE is one (401). The router prefers an exact match
+ *                         over a prefix match, so wrapping the prefix alone leaves these open.
  *   - prefix "/api"     : RPC surface (401)
+ *   - exact "/api/*"    : same class as above
  *   - upgrades /api/remote.mux (+ legacy /api/events.mux, /api/events.host): (reject upgrade)
+ *
+ * Admission (0.3.6): a request is let through with EITHER a plugin session cookie
+ * OR the host-direct bridge — a loopback request the core itself already
+ * authenticated (connection.requestRejection) or the core's own launch-token
+ * exchange. The document gate (prefix "") accepts only the latter, so browsers
+ * still meet the login page. See "宿主直连信任桥" below.
  *
  * Sessions: server-side, persisted across restarts (H3), carried by an
  * HttpOnly cookie `dsh_wua_session`; changing the password revokes every
@@ -159,6 +239,7 @@ async function dummyVerify(password) {
 export {
   hashPassword, verifyPassword, auditLog, readAuditEntries, resolveDataDirFrom, DATA_DIR,
   resolveRedirectScheme, postLoginRedirect,
+  isLoopbackPeer, coreLaunchToken, coreTokenExchange, coreAdmitsHost, hostDirect,
 }
 
 // ---------------- 数据目录与文件 ----------------
@@ -355,7 +436,8 @@ async function auditLog(ctx, event, fields) {
       let v = fields[key]
       if (v === undefined) continue
       if (key === 'ip' && typeof v === 'string') v = anonymizeIp(v)
-      entry[key] = typeof v === 'string' || typeof v === 'number' ? v : String(v)
+      // null 保持 null：早先会被 String() 成字符串 "null"，日志里读起来像出了故障
+      entry[key] = (v === null || typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') ? v : String(v)
     }
     appendFileSync(target, JSON.stringify(entry) + '\n', 'utf8')
   } catch (e) {
@@ -756,6 +838,8 @@ f.addEventListener('submit', function (ev) {
 //
 // 若找不到预期路由（dsh 内部结构变化），shapeCheck 失败并明确报错，
 // 且 setup/configure 拒绝启用闸门（fail-closed：宁可不可用，不可裸奔）。
+//
+// 准入判定由调用方以 admit(req) 注入：插件会话 或 宿主直连（见下节信任桥）。
 
 const API_PREFIX = '/api'
 const PLUGINS_PREFIX = '/plugins'
@@ -770,14 +854,112 @@ function rejectUpgrade401(socket) {
   try { socket.destroy() } catch (e) { /* ignore */ }
 }
 
+// ---------------- 宿主直连信任桥（C6 / DSH Desktop） ----------------
+//
+// 官方桌面端的 shell 代理让渲染器永远拿不到插件会话 Cookie（见文件头部 0.3.6 说明），
+// 所以对"核心自己已经认证过、且来自回环"的宿主直连必须让路。这里只放行两类：
+//
+//   1. coreAdmitsHost()   —— 核心已放行。等价于官方扩展点
+//      ctx.connection.admit(request) 会答出 operator（信任栅栏 + 浏览器会话都通过）。
+//      桌面端 shell 转发渲染器请求时只带核心 Cookie，正是这一类。
+//   2. coreTokenExchange() —— 核心自己的 token→cookie 交换请求（GET /?token=<令牌>）。
+//      必须原样交给核心，否则核心 Cookie 永远发不出来（桌面端启动即失败）。
+//
+// 两者都要求 socket 是回环：远端/隧道来的浏览器依旧必须走插件口令登录。
+// 回环已在信任边界之内（同机进程可直接读 DATA_DIR 里的会话令牌与核心签名密钥），
+// 所以这不是新增的可利用面；相反，把豁免限制在回环，保住了插件真正想守的那条线——
+// 「光知道 launch token 不足以进 WebUI，还得有口令」。
+//
+// 核心结构变化时的行为是 fail-closed：拿不到 connection 服务（旧核心 / 服务缺失）时
+// 两个函数都返回 false，闸门退回「只认插件会话」的严格形态，绝不会"放行一切"。
+
+/** 请求是否来自回环地址（IPv4 127.0.0.0/8、IPv6 ::1，含 ::ffff: 映射写法）。 */
+function isLoopbackPeer(req) {
+  try {
+    const raw = req && req.socket ? req.socket.remoteAddress : null
+    if (typeof raw !== 'string' || raw === '') return false
+    const addr = raw.startsWith('::ffff:') ? raw.slice('::ffff:'.length) : raw
+    return addr === '::1' || addr.startsWith('127.')
+  } catch (e) {
+    return false
+  }
+}
+
+/**
+ * 核心是否已放行该请求（信任栅栏 + 浏览器会话）。
+ * 刻意不复刻核心的判定逻辑，而是直接问它：requestRejection 是核心公开契约的一部分，
+ * 返回 undefined 即"它会以 operator 身份接纳"。
+ */
+function coreAdmitsHost(ctx, req) {
+  try {
+    const connection = ctx.get('connection')
+    if (!connection || typeof connection.requestRejection !== 'function') return false
+    return connection.requestRejection(req) === undefined
+  } catch (e) {
+    return false
+  }
+}
+
+/**
+ * 本进程的核心 launch token 及其 query 参数名。
+ * 通过公开 API authenticatedUrl() 反推，不硬编码核心内部字段；
+ * 参数名也取自该 URL，避免与核心的 TOKEN_QUERY 常量耦合。
+ * @returns {{ name: string, value: string } | null}
+ */
+function coreLaunchToken(ctx) {
+  try {
+    const connection = ctx.get('connection')
+    if (!connection || typeof connection.authenticatedUrl !== 'function') return null
+    // baseUrl 只用于承载 query：取回后只读它的 searchParams。
+    const url = new URL(connection.authenticatedUrl('http://127.0.0.1/'))
+    const entries = [...url.searchParams.entries()]
+    if (entries.length === 1) return { name: entries[0][0], value: entries[0][1] }
+    const value = url.searchParams.get('token')
+    return value === null ? null : { name: 'token', value }
+  } catch (e) {
+    return null
+  }
+}
+
+/**
+ * 该请求是否就是核心自己的 token→cookie 交换（回环 + GET / + 唯一 token 参数 + 令牌匹配）。
+ * 条件刻意与核心 authorizeIndex() 的接受条件对齐：不满足时核心本来也会 401，
+ * 这里只是决定"要不要让它自己去处理"。
+ */
+function coreTokenExchange(ctx, req) {
+  if (!isLoopbackPeer(req)) return false
+  if (!req || req.method !== 'GET') return false
+  const param = coreLaunchToken(ctx)
+  if (param === null || param.value === '') return false
+  let url = null
+  try {
+    url = new URL(req.url || '/', 'http://dsh.invalid')
+  } catch (e) {
+    return false
+  }
+  if (url.pathname !== '/') return false
+  if (url.searchParams.getAll(param.name).length !== 1) return false
+  return safeTokenEquals(url.searchParams.get(param.name), param.value)
+}
+
+/**
+ * 宿主直连（DSH Desktop shell）：回环 + （核心已认证 或 核心 token 交换）。
+ * @returns {boolean} true 表示无需插件会话即可放行。
+ */
+function hostDirect(ctx, req) {
+  if (!isLoopbackPeer(req)) return false
+  return coreAdmitsHost(ctx, req) || coreTokenExchange(ctx, req)
+}
+
 /**
  * 安装运行时路由闸门。带周期重扫：apply() 可能早于 client-connection 的
  * 路由注册执行（loader 波次顺序不保证），每 2 秒重扫路由表直到全部
  * 找到（上限 60 秒）。gate 状态动态更新，供 status 端点与 fail-closed
  * 检查读取。
+ * @param admit - 准入判定（插件会话或宿主直连）；返回 false 时闸门回 401。
  * @returns {{ ok: () => boolean, problems: () => string[], undo: () => void }}
  */
-function installRouteGate(ctx, checkRequest, log) {
+function installRouteGate(ctx, admit, log) {
   const ws = ctx.webServer
   const problems = new Set()
   const undos = []
@@ -797,7 +979,7 @@ function installRouteGate(ctx, checkRequest, log) {
     } catch (e) { coreHasRequestGate = false }
     const useDeputy = loopbackDeputy && !coreHasRequestGate
     const wrapped = async (req, res) => {
-      if (!checkRequest(req)) {
+      if (!admit(req)) {
         res.writeHead(401, { 'content-type': 'text/plain; charset=utf-8' })
         res.end('unauthorized')
         return
@@ -827,7 +1009,7 @@ function installRouteGate(ctx, checkRequest, log) {
   const wrapUpgrade = (route) => {
     const original = route.handler
     const wrapped = (req, socket, head) => {
-      if (checkRequest(req)) return original(req, socket, head)
+      if (admit(req)) return original(req, socket, head)
       rejectUpgrade401(socket)
     }
     route.handler = wrapped
@@ -837,6 +1019,12 @@ function installRouteGate(ctx, checkRequest, log) {
   // 已包装的路由打标记，避免重复包装
   const wrapped = new WeakSet()
   const PROTECTED_PREFIXES = [API_PREFIX, PLUGINS_PREFIX]
+  // 顶层 exact 路由里也可能有受保护前缀的成员（实测：client-hmr 的 `/plugins/events`
+  // SSE 就是一条）。路由表对 exact 的优先级高于 prefix，只包装 prefix 会让这类路由
+  // 绕过闸门——匿名 GET 就能拿到整个客户端插件图（插件 id、bundle URL、revision），
+  // 与「未认证客户端无法加载资源或建立实时连接」的承诺相矛盾。
+  // 插件自身的端点（/dsh-webui-auth/*）不在受保护前缀下，不会被这里碰到。
+  const protectsExactPath = (path) => PROTECTED_PREFIXES.some((pfx) => path === pfx || path.startsWith(pfx + '/'))
   const scanOnce = () => {
     if (undone) return
     for (const pfx of PROTECTED_PREFIXES) {
@@ -849,6 +1037,18 @@ function installRouteGate(ctx, checkRequest, log) {
       } else if (route === undefined) {
         problems.add(`prefix route "${pfx}" not registered yet`)
       }
+    }
+    // 同前缀的顶层 exact 路由：逐个包装。晚注册的会在下一轮重扫里被捕获。
+    if (ws.exact instanceof Map) {
+      for (const [path, route] of ws.exact) {
+        if (!protectsExactPath(path) || wrapped.has(route)) continue
+        wrapped.add(route)
+        const isApi = path === API_PREFIX || path.startsWith(API_PREFIX + '/')
+        undos.push(wrapHttp(route, { loopbackDeputy: isApi }))
+        log(`wrapped exact route ${path}`)
+      }
+    } else {
+      log('route gate: webServer.exact is unavailable — exact routes under ' + PROTECTED_PREFIXES.join('/') + ' cannot be wrapped')
     }
     // alpha.2 起仅存在 /api/remote.mux（由 api-gateway 注册）；旧核心仍用
     // events.mux/events.host。候选列表兼容两代：已注册的全部包装，其余不计问题。
@@ -1105,12 +1305,41 @@ export async function apply(ctx) {
     sessions.deleteAllExcept(keepToken)
   }
 
+  // C6: 宿主直连（DSH Desktop shell）—— 核心自己认证过的回环请求，以及核心自己的
+  // token→cookie 交换。桌面端渲染器拿不到插件会话 Cookie（shell 代理丢弃 set-cookie），
+  // 所以 /api、/plugins、WebSocket 必须靠这条通道放行，否则桌面端整片 401。
+  function hostAdmitted(req) {
+    return hostDirect(ctx, req)
+  }
+
+  /** 准入：插件会话 或 宿主直连 —— 用于 /api、/plugins、WebSocket 与插件自身端点。 */
+  function admitted(req) {
+    return checkRequest(req) || hostAdmitted(req)
+  }
+
+  /**
+   * 文档级准入：只认插件会话，外加核心自己的 token 交换。
+   * 刻意**不**接受 hostAdmitted()：浏览器访问 WebUI 依旧会落到登录页，
+   * 口令闸门对"知道 token 的远端客户端"依然有效。
+   */
+  function admittedDocument(req) {
+    return checkRequest(req) || coreTokenExchange(ctx, req)
+  }
+
   // H2: 安装运行时路由闸门
-  const gate = installRouteGate(ctx, checkRequest, (m) => ctx.logger.info('[dsh-webui-auth] ' + m))
+  const gate = installRouteGate(ctx, admitted, (m) => ctx.logger.info('[dsh-webui-auth] ' + m))
   ctx.effect(() => gate.undo, 'dsh-webui-auth: route gate')
   if (!gate.ok()) {
     ctx.logger.error('[dsh-webui-auth] ROUTE GATE INCOMPLETE — ' + gate.problems().join('; ')
       + '. /api and/or WebSocket may be unprotected; the gate will still wrap them if they register later.')
+  }
+  // 宿主直连桥依赖核心的公开契约（connection.requestRejection / authenticatedUrl）。
+  // 拿不到时不是错误：闸门退回严格形态（只认插件会话），但桌面端会因此不可用，
+  // 所以在日志里明确报出来，免得又一次变成"设置页全 401"的哑故障。
+  if (coreLaunchToken(ctx) !== null) {
+    ctx.logger.info('[dsh-webui-auth] host carrier bridge active (core token exchange + core-authenticated loopback requests)')
+  } else {
+    ctx.logger.warn('[dsh-webui-auth] host carrier bridge unavailable: no connection.authenticatedUrl — DSH Desktop and other non-browser carriers will be denied')
   }
 
   ctx.logger.info('[dsh-webui-auth] started, credentials file: ' + configPath())
@@ -1190,10 +1419,20 @@ export async function apply(ctx) {
             sendJson(res, 200, { ok: false, error: 'invalid' })
             return
           }
-          const s = createSession(username, ttlOf(creds))
+          const sessionTtl = ttlOf(creds)
+          const s = createSession(username, sessionTtl)
           res.setHeader('Set-Cookie', sessionCookie(s.token, s.maxAge))
           await auditLog(ctx, 'login_success', { username, ip: meta.ip, ua: meta.ua })
-          sendJson(res, 200, { ok: true, redirect: postLoginRedirect(ctx, req) })
+          const payload = { ok: true, redirect: postLoginRedirect(ctx, req) }
+          // C8 桌面端锁：宿主直连的调用者拿不到 Cookie（shell 每次转发都会替换 Cookie 头，
+          // 并把响应的 set-cookie 丢弃），所以由客户端插件自己保存令牌。只在宿主直连请求上
+          // 返回令牌——浏览器永远拿不到，HttpOnly 的语义不受影响；而且这不多给任何权限：
+          // 宿主直连本来就是核心已认证的调用者。
+          if (hostAdmitted(req)) {
+            payload.desktopToken = s.token
+            payload.desktopTtl = sessionTtl
+          }
+          sendJson(res, 200, payload)
           return
         }
         sendJson(res, 405, { error: '仅支持 GET/POST' })
@@ -1270,18 +1509,65 @@ export async function apply(ctx) {
           sendJson(res, 405, { error: '仅支持 POST' })
           return
         }
-        const token = cookieOf(req, COOKIE_NAME)
-        const s = token ? sessions.get(token) : null
+        const cookieToken = cookieOf(req, COOKIE_NAME)
+        const cookieSession = cookieToken ? sessions.get(cookieToken) : null
         destroySession(req)
+        // C8 桌面端锁：宿主直连的调用者没有 Cookie，改为在请求体里带上令牌，
+        // 这样"退出登录"能在服务端真正吊销会话（而不只是清掉本地解锁状态）。
+        const body = await readJsonBody(req, res)
+        let desktopSession = null
+        if (body !== null && typeof body.token === 'string') {
+          const supplied = body.token.trim()
+          if (hostAdmitted(req) && /^[0-9a-f]{48}$/.test(supplied)) {
+            desktopSession = sessions.get(supplied) || null
+            sessions.delete(supplied)
+          }
+        }
         res.setHeader('Set-Cookie', clearSessionCookie())
         const meta = requestMeta(req)
-        await auditLog(ctx, 'logout', { username: s ? s.username : null, ip: meta.ip, ua: meta.ua })
+        const who = cookieSession || desktopSession
+        await auditLog(ctx, 'logout', { username: who ? who.username : null, ip: meta.ip, ua: meta.ua })
         sendJson(res, 200, { ok: true })
       } catch (e) {
         sendJson(res, 500, { error: e && e.message ? e.message : String(e) })
       }
     },
   }), 'dsh-webui-auth: logout')
+
+  // C8 桌面端锁：校验客户端插件自己保存的解锁令牌。
+  // 令牌本身就是凭据（24 字节随机），因此这个端点不再要求会话；它只回答"令牌是否仍然有效"，
+  // 让桌面端能在应用重启/刷新后决定是否需要重新输入口令。
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: '/dsh-webui-auth/desktop-session',
+    handler: async (req, res) => {
+      try {
+        if (req.method !== 'POST') {
+          sendJson(res, 405, { error: '仅支持 POST' })
+          return
+        }
+        const body = await readJsonBody(req, res)
+        if (body === null) return
+        const token = typeof body.token === 'string' ? body.token.trim() : ''
+        if (!/^[0-9a-f]{48}$/.test(token)) {
+          sendJson(res, 200, { ok: false })
+          return
+        }
+        const s = sessions.get(token)
+        if (!s || s.expiresAt <= Date.now()) {
+          if (s) sessions.delete(token)
+          sendJson(res, 200, { ok: false })
+          return
+        }
+        // 与 checkRequest 一致：浏览器会话（ttl=0）在活跃使用期间滑动续期
+        if (s.browser === true) s.expiresAt = Date.now() + SESSION_BROWSER_TTL_MS
+        const creds = await readCredentials(ctx)
+        sendJson(res, 200, { ok: true, username: s.username, ttl: ttlOf(creds) })
+      } catch (e) {
+        sendJson(res, 500, { error: e && e.message ? e.message : String(e) })
+      }
+    },
+  }), 'dsh-webui-auth: desktop session')
 
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact',
@@ -1292,16 +1578,22 @@ export async function apply(ctx) {
           sendJson(res, 405, { error: '仅支持 GET' })
           return
         }
-        if (enabledFlag && !checkRequest(req)) {
+        if (!admitted(req)) {
           sendJson(res, 401, { error: 'unauthorized' })
           return
         }
         const creds = await readCredentials(ctx)
         const enabled = isEnabled(creds)
+        // carrier 说明本次调用是凭什么被放行的：'session' = 浏览器口令会话，
+        // 'host' = 宿主直连（核心自己认证，或核心 token 交换）。桌面端永远是后者，
+        // 客户端据此提示"退出登录不影响桌面端"。
+        const sessionToken = cookieOf(req, COOKIE_NAME)
+        const hasSession = sessionToken !== null && sessions.get(sessionToken) !== undefined
         sendJson(res, 200, {
           enabled,
           username: enabled ? creds.username : null,
           ttl: ttlOf(creds),
+          carrier: hasSession ? 'session' : (hostAdmitted(req) ? 'host' : null),
           sessionsPersisted: sessions.ok,
           gate: { ok: gate.ok(), problems: gate.problems().slice(0, 3) },
         })
@@ -1320,7 +1612,7 @@ export async function apply(ctx) {
           sendJson(res, 405, { error: '仅支持 GET' })
           return
         }
-        if (enabledFlag && !checkRequest(req)) {
+        if (!admitted(req)) {
           sendJson(res, 401, { error: 'unauthorized' })
           return
         }
@@ -1346,7 +1638,7 @@ export async function apply(ctx) {
           sendJson(res, 405, { error: '仅支持 POST' })
           return
         }
-        if (enabledFlag && !checkRequest(req)) {
+        if (!admitted(req)) {
           sendJson(res, 401, { error: 'unauthorized' })
           return
         }
@@ -1433,7 +1725,7 @@ export async function apply(ctx) {
           sendJson(res, 405, { error: '仅支持 POST' })
           return
         }
-        if (enabledFlag && !checkRequest(req)) {
+        if (!admitted(req)) {
           sendJson(res, 401, { error: 'unauthorized' })
           return
         }
@@ -1506,6 +1798,18 @@ export async function apply(ctx) {
           res.writeHead(404)
           res.end()
           return
+        }
+        // C6：核心自己的 token→cookie 交换必须原样交给核心。桌面端 shell 的启动握手
+        // 用 fetch(ready.url, {redirect:"manual"}) 明确要求 303 + set-cookie，插件的
+        // 302 会让它直接抛 "Desktop Host authentication failed"；网页端后续 /api 也会
+        // 因为拿不到核心 cookie 而全 401。admittedDocument() 只在这一个条件下放弃拦截。
+        if (admittedDocument(req)) {
+          const fallback = ctx.webServer.fallback
+          if (fallback !== undefined) {
+            await fallback(req, res)
+            return
+          }
+          ctx.logger.warn('[dsh-webui-auth] core token exchange could not be delegated: webServer.fallback is unavailable')
         }
         res.writeHead(302, { location: '/dsh-webui-auth/login' })
         res.end()
