@@ -951,6 +951,83 @@ function hostDirect(ctx, req) {
   return coreAdmitsHost(ctx, req) || coreTokenExchange(ctx, req)
 }
 
+// ---------------- 核心兜底席位（webServer.fallback）形态适配 ----------------
+//
+// 插件的文档闸门要放行时，最终必须把请求交还给核心自己的兜底席位，让
+// dsh-host-frontend-static 去取 index.html / 完成 token→cookie 交换。
+// 这个席位的值形态随核心版本变过（issue #9）：
+//
+//   · 旧核心：registerFallback(handler)          → fallback 是**函数**
+//   · 0.2.2-rc.1+：registerFallback({ resource }) → fallback 是**对象**
+//
+// 插件原先只写 `if (fallback !== undefined) await fallback(req, res)`，把
+// 「存在」当成「可调用」，在新核心上抛 TypeError: fallback is not a function，
+// 又被外层 catch 折成 500 —— 全站白屏。这里按形状分派，未知形态绝不硬调。
+
+/** 兜底席位的形态：'absent'（核心还没注册）| 'handler' | 'resource' | 'unknown'。 */
+function fallbackShape(webServer) {
+  if (!webServer) return 'absent'
+  const fallback = webServer.fallback
+  if (fallback === undefined) return 'absent'
+  if (typeof fallback === 'function') return 'handler'
+  if (fallback !== null && typeof fallback === 'object'
+    && 'resource' in fallback && typeof webServer.serveResource === 'function') return 'resource'
+  return 'unknown'
+}
+
+/**
+ * 把请求交还核心兜底席位。@returns true 表示已由核心接管；false 表示形态
+ * 不认识/尚未注册，调用方自行兜底（不要抛 TypeError，也不要折成 500）。
+ */
+async function delegateFallback(ctx, req, res) {
+  const ws = ctx.webServer
+  switch (fallbackShape(ws)) {
+    case 'handler':
+      await ws.fallback(req, res)
+      return true
+    case 'resource':
+      // 核心公开方法：request/response 与 Fetch Request 之间的适配由核心自己做，
+      // 不能拿对象直接当函数调，也不能自己拼 Response 写回（会丢 HEAD / 压缩等语义）。
+      await ws.serveResource(req, res, new URL(req.url || '/', 'http://x'), ws.fallback.resource)
+      return true
+    default:
+      return false
+  }
+}
+
+/** 形态不认识时的**一次性**诊断：说清期望什么、实际是什么，别让 500 掩盖过去。 */
+let fallbackProblemLogged = false
+function reportFallbackProblem(ctx, where) {
+  if (fallbackProblemLogged) return
+  fallbackProblemLogged = true
+  const ws = ctx.webServer
+  const fallback = ws ? ws.fallback : undefined
+  const actual = fallback === undefined
+    ? 'undefined'
+    : typeof fallback === 'function'
+      ? 'function'
+      : (fallback !== null && typeof fallback === 'object')
+        ? 'object { ' + Object.keys(fallback).join(', ') + ' }'
+        : typeof fallback
+  const canServe = !!(ws && typeof ws.serveResource === 'function')
+  try {
+    ctx.logger.error('[dsh-webui-auth] INCOMPATIBLE CORE: cannot hand ' + where
+      + ' back to webServer.fallback — expected a handler function, or { resource } together with'
+      + ' webServer.serveResource(); got ' + actual + ' (serveResource: ' + (canServe ? 'present' : 'missing') + ').'
+      + ' webServer.fallback shape may have changed again; authenticated pages answer 404 until the plugin is updated.')
+  } catch (e) { /* logging must never throw */ }
+}
+
+/** 纯文本 404：形态不认识时给操作者一句能看懂的话，而不是空白页/500。 */
+function sendFallbackUnavailable(res) {
+  res.writeHead(404, {
+    'content-type': 'text/plain; charset=utf-8',
+    'x-content-type-options': 'nosniff',
+    'cache-control': 'no-store',
+  })
+  res.end('dsh-webui-auth: core webServer.fallback is unavailable or incompatible\n')
+}
+
 /**
  * 安装运行时路由闸门。带周期重扫：apply() 可能早于 client-connection 的
  * 路由注册执行（loader 波次顺序不保证），每 2 秒重扫路由表直到全部
@@ -1341,6 +1418,17 @@ export async function apply(ctx) {
   } else {
     ctx.logger.warn('[dsh-webui-auth] host carrier bridge unavailable: no connection.authenticatedUrl — DSH Desktop and other non-browser carriers will be denied')
   }
+  // issue #9 自检：兜底席位形态每次核心升级都可能变。认得出就报一句，认不出就
+  // 明确报「不兼容当前核心版本」——不要等到用户登录换 cookie 时才以 500 暴露。
+  // 'absent' 可能只是 frontend-static 尚未注册，留到首个文档请求时再诊断。
+  {
+    const shape = fallbackShape(ctx.webServer)
+    if (shape === 'handler' || shape === 'resource') {
+      ctx.logger.info('[dsh-webui-auth] core fallback seat: ' + shape)
+    } else if (shape === 'unknown') {
+      ctx.logger.error('[dsh-webui-auth] INCOMPATIBLE CORE: webServer.fallback is neither a handler function nor { resource } + webServer.serveResource(); authenticated pages will answer 404')
+    }
+  }
 
   ctx.logger.info('[dsh-webui-auth] started, credentials file: ' + configPath())
   if (!enabledFlag) {
@@ -1595,6 +1683,9 @@ export async function apply(ctx) {
           ttl: ttlOf(creds),
           carrier: hasSession ? 'session' : (hostAdmitted(req) ? 'host' : null),
           sessionsPersisted: sessions.ok,
+          // 核心兜底席位形态（handler | resource | absent | unknown）：升级核心后
+          // 如果这里变成 unknown，文档请求会 404 —— 支持时先看这个字段。
+          fallback: fallbackShape(ctx.webServer),
           gate: { ok: gate.ok(), problems: gate.problems().slice(0, 3) },
         })
       } catch (e) {
@@ -1790,13 +1881,11 @@ export async function apply(ctx) {
               return
             }
           }
-          const fallback = ctx.webServer.fallback
-          if (fallback !== undefined) {
-            await fallback(req, res)
-            return
-          }
-          res.writeHead(404)
-          res.end()
+          // 兜底席位的形态随核心版本变化（函数 / {resource}），交给 delegateFallback 分派；
+          // 未知形态不硬调、也不折成 500，回 404 并输出一次性诊断（issue #9）。
+          if (await delegateFallback(ctx, req, res)) return
+          reportFallbackProblem(ctx, 'the authenticated document')
+          sendFallbackUnavailable(res)
           return
         }
         // C6：核心自己的 token→cookie 交换必须原样交给核心。桌面端 shell 的启动握手
@@ -1804,12 +1893,12 @@ export async function apply(ctx) {
         // 302 会让它直接抛 "Desktop Host authentication failed"；网页端后续 /api 也会
         // 因为拿不到核心 cookie 而全 401。admittedDocument() 只在这一个条件下放弃拦截。
         if (admittedDocument(req)) {
-          const fallback = ctx.webServer.fallback
-          if (fallback !== undefined) {
-            await fallback(req, res)
-            return
-          }
-          ctx.logger.warn('[dsh-webui-auth] core token exchange could not be delegated: webServer.fallback is unavailable')
+          // 同上：token 交换必须原样交给核心（303 + set-cookie），不能因为席位形态
+          // 是对象就直接调用函数。
+          if (await delegateFallback(ctx, req, res)) return
+          reportFallbackProblem(ctx, 'the core token exchange')
+          sendFallbackUnavailable(res)
+          return
         }
         res.writeHead(302, { location: '/dsh-webui-auth/login' })
         res.end()

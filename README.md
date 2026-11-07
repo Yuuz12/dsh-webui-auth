@@ -36,6 +36,8 @@ DSH WebUI 身份认证插件（持久化插件）。在「设置 → 身份认�
 
   两者**只对回环 socket 生效**；文档闸门（SPA / 资源）刻意只放行 token 交换、**不**接受 `coreAdmitsHost`，所以**浏览器访问 WebUI 依旧会看到登录页**，远端/隧道客户端依旧必须输入口令。回环本身已在信任边界之内（同机进程可直接读数据目录里的会话令牌与核心签名密钥），因此这不让渡任何实际可利用面；核心结构变化（拿不到 `connection` 服务）时两个判定都返回 false，闸门退回严格形态——fail-closed。
 
+- **核心兜底席位形态适配（0.3.7，修 #9）**：`webServer.fallback` 的值形态随核心版本变过——旧核心是 handler 函数，DSH 核心 **0.2.2-rc.1** 的 `dsh-host-frontend-static` 用 `registerFallback({ resource })` 占位，所以它是**对象**。插件原先只判断 `fallback !== undefined` 就把值当函数 `await fallback(req, res)`，在新核心上抛 `TypeError: fallback is not a function`，又被外层 catch 折成 500：token→cookie 交换 500、已登录首页也 500，浏览器被弹回登录页（表现为白屏/卡死）。0.3.7 改为**按形状分派**：函数直接调用；`{ resource }` 走核心公开的 `webServer.serveResource(req, res, target, resource)`；两者都不是时回 **404** 并输出一次性 `INCOMPATIBLE CORE` 诊断（期望什么、实际是什么、`serveResource` 在不在），不再把「核心接口形态变了」伪装成 500。`/dsh-webui-auth/status` 新增 `fallback` 字段（`handler` / `resource` / `absent` / `unknown`），升级核心后先看这一项。
+
 会话为**服务端会话，持久化到磁盘**（`sessions.jsonl`，重启 DSH 不掉线，到期自动失效），由 `HttpOnly; SameSite=Lax` Cookie（`dsh_wua_session`）携带，JS 无法读取；修改密码会**吊销所有其他会话**。
 
 ## 安装
